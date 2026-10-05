@@ -27,7 +27,7 @@ from std.math import ceildiv, floor
 
 from max.gpu import thread_idx
 from max.gpu.sync import barrier
-from max.gpu.host import DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, row_major, stack_allocation
 
@@ -196,37 +196,56 @@ def _compress_block_kernel[
 # ======================================================================
 
 
+struct _CompressBuffers(Movable):
+    """Device scratch for one single-block compress, allocated once per
+    `gpu_compress_batch` call and reused by every tile (previously each tile
+    allocated five fresh device buffers)."""
+
+    var means: DeviceBuffer[_DT]
+    var weights: DeviceBuffer[_DT]
+    var out_means: DeviceBuffer[_DT]
+    var out_weights: DeviceBuffer[_DT]
+    var count: DeviceBuffer[_FLAG]
+
+    def __init__(out self, ctx: DeviceContext) raises:
+        self.means = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
+        self.weights = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
+        self.out_means = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
+        self.out_weights = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
+        self.count = ctx.enqueue_create_buffer[_FLAG](BLOCK_CAP)
+
+
 def _compress_once[
     S: ScaleFunction
 ](
     ctx: DeviceContext,
+    bufs: _CompressBuffers,
     means: List[Float32],
     weights: List[Float32],
+    lo: Int,
+    hi: Int,
     compression: Float32,
-) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
-    """Run one single-block compress over <= BLOCK_CAP sorted pairs."""
-    var n = len(means)
-    var out_m = List[Float32]()
-    var out_w = List[Float32]()
-    if n == 0:
-        return (out_m^, out_w^)
+    mut out_m: List[Float32],
+    mut out_w: List[Float32],
+) raises where (S.DT == _DT):
+    """Compress the sorted slice `[lo, hi)` (<= BLOCK_CAP pairs) in one block,
+    reusing `bufs`, and *append* the surviving centroids to `out_m` / `out_w`.
+    """
+    var n = hi - lo
+    if n <= 0:
+        return
 
-    var mbuf = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
-    var wbuf = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
-    var ombuf = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
-    var owbuf = ctx.enqueue_create_buffer[_DT](BLOCK_CAP)
-    var cbuf = ctx.enqueue_create_buffer[_FLAG](BLOCK_CAP)
-    with mbuf.map_to_host() as hm, wbuf.map_to_host() as hw:
+    with bufs.means.map_to_host() as hm, bufs.weights.map_to_host() as hw:
         var tm = TileTensor(hm, _cap_f32)
         var tw = TileTensor(hw, _cap_f32)
         for i in range(n):
-            tm[i] = means[i]
-            tw[i] = weights[i]
-    var tm = TileTensor(mbuf, _cap_f32)
-    var tw = TileTensor(wbuf, _cap_f32)
-    var tom = TileTensor(ombuf, _cap_f32)
-    var tow = TileTensor(owbuf, _cap_f32)
-    var tc = TileTensor(cbuf, _cap_f32)
+            tm[i] = means[lo + i]
+            tw[i] = weights[lo + i]
+    var tm = TileTensor(bufs.means, _cap_f32)
+    var tw = TileTensor(bufs.weights, _cap_f32)
+    var tom = TileTensor(bufs.out_means, _cap_f32)
+    var tow = TileTensor(bufs.out_weights, _cap_f32)
+    var tc = TileTensor(bufs.count, _cap_f32)
 
     comptime kernel = _compress_block_kernel[S]
     ctx.enqueue_function[kernel](
@@ -242,16 +261,15 @@ def _compress_once[
     )
 
     var kept: Int
-    with cbuf.map_to_host() as hc:
+    with bufs.count.map_to_host() as hc:
         var t = TileTensor(hc, _cap_f32)
         kept = Int(rebind[Scalar[_FLAG]](t[0]))
-    with ombuf.map_to_host() as hm, owbuf.map_to_host() as hw:
+    with bufs.out_means.map_to_host() as hm, bufs.out_weights.map_to_host() as hw:
         var rm = TileTensor(hm, _cap_f32)
         var rw = TileTensor(hw, _cap_f32)
         for i in range(kept):
             out_m.append(rebind[Scalar[_DT]](rm[i]))
             out_w.append(rebind[Scalar[_DT]](rw[i]))
-    return (out_m^, out_w^)
 
 
 def gpu_compress_batch[
@@ -259,68 +277,56 @@ def gpu_compress_batch[
 ](
     means: List[Float32], weights: List[Float32], compression: Float32
 ) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
-    """Compress an arbitrary-length (mean, weight) set into t-digest centroids
-    on the GPU, using scale function `S`.
+    """Convenience overload: creates a `DeviceContext` for this call. Callers
+    that compress repeatedly should create one context and use the
+    `gpu_compress_batch[S](ctx, ...)` overload instead."""
+    var ctx = DeviceContext()
+    return gpu_compress_batch[S](ctx, means, weights, compression)
 
-    The input need not be sorted. Large inputs are sorted on the host, split
-    into BLOCK_CAP tiles, each compressed on-device, and the partial centroids
-    reduced hierarchically until a single final block yields the result.
+
+def gpu_compress_batch[
+    S: ScaleFunction
+](
+    ctx: DeviceContext,
+    means: List[Float32],
+    weights: List[Float32],
+    compression: Float32,
+) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
+    """Compress an arbitrary-length (mean, weight) set into t-digest centroids
+    on the GPU, using scale function `S` and the caller's `ctx`.
+
+    The input need not be sorted. It is sorted once on the host (O(n log n)),
+    split into BLOCK_CAP tiles, each compressed on-device, and the partial
+    centroids reduced hierarchically until a single final block yields the
+    result. One set of device buffers is allocated per call and reused by every
+    tile.
     """
     var n = len(means)
-    var out_m = List[Float32]()
-    var out_w = List[Float32]()
     if n == 0:
-        return (out_m^, out_w^)
+        return (List[Float32](), List[Float32]())
 
-    var ctx = DeviceContext()
+    var bufs = _CompressBuffers(ctx)
 
-    # Sort the whole input by mean once (host-side; parallel multi-block sort is
-    # a later optimization). Keep (mean, weight) together.
-    var sm = means.copy()
-    var sw = weights.copy()
-    cpu_sort_pairs(sm, sw)
+    var cur_m = means.copy()
+    var cur_w = weights.copy()
 
-    # First pass: compress each BLOCK_CAP tile.
-    var cur_m = List[Float32]()
-    var cur_w = List[Float32]()
-    var i = 0
-    while i < n:
-        var hi = min(i + BLOCK_CAP, n)
-        var tm = List[Float32]()
-        var tw = List[Float32]()
-        for j in range(i, hi):
-            tm.append(sm[j])
-            tw.append(sw[j])
-        var part = _compress_once[S](ctx, tm, tw, compression)
-        for j in range(len(part[0])):
-            cur_m.append(part[0][j])
-            cur_w.append(part[1][j])
-        i = hi
-
-    # Hierarchical reduction: while the survivors exceed one block, sort and
-    # recompress in tiles. Each pass strictly shrinks the set (a tile of
-    # centroids compresses to <= its size), so this terminates.
-    while len(cur_m) > BLOCK_CAP:
+    # Compress in BLOCK_CAP tiles; repeat while the survivors exceed one block.
+    # Each pass strictly shrinks the set (a tile compresses to <= its size), so
+    # this terminates. Re-sorting between passes keeps every tile mean-sorted.
+    while True:
         cpu_sort_pairs(cur_m, cur_w)
-        var next_m = List[Float32]()
-        var next_w = List[Float32]()
-        var p = 0
         var m = len(cur_m)
+        var next_m = List[Float32](capacity=m)
+        var next_w = List[Float32](capacity=m)
+        var p = 0
         while p < m:
-            var hi2 = min(p + BLOCK_CAP, m)
-            var tm2 = List[Float32]()
-            var tw2 = List[Float32]()
-            for j in range(p, hi2):
-                tm2.append(cur_m[j])
-                tw2.append(cur_w[j])
-            var part2 = _compress_once[S](ctx, tm2, tw2, compression)
-            for j in range(len(part2[0])):
-                next_m.append(part2[0][j])
-                next_w.append(part2[1][j])
-            p = hi2
+            var hi = min(p + BLOCK_CAP, m)
+            _compress_once[S](
+                ctx, bufs, cur_m, cur_w, p, hi, compression, next_m, next_w
+            )
+            p = hi
         cur_m = next_m^
         cur_w = next_w^
-
-    # Final pass: one block over the <= BLOCK_CAP survivors.
-    cpu_sort_pairs(cur_m, cur_w)
-    return _compress_once[S](ctx, cur_m, cur_w, compression)
+        if m <= BLOCK_CAP:
+            # That pass was the single final block.
+            return (cur_m^, cur_w^)

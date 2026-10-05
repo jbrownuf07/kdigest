@@ -108,6 +108,29 @@ def test_sort_pairs() raises:
         _check_sort(lens[i])
 
 
+def test_cpu_sort_pairs_large_stable() raises:
+    # The host sort is on the gpu_compress_batch hot path, so it is a bottom-up
+    # merge sort rather than insertion sort. Check it past the insertion-run
+    # size and across several merge passes, with heavy ties so stability
+    # (equal keys keep input order) is exercised. Runs without a GPU.
+    var sizes = [33, 100, 1_000, 4_097, 100_000]
+    for si in range(len(sizes)):
+        var n = sizes[si]
+        var rng = _Rng(0xD00D + UInt64(n))
+        var k = List[Float32]()
+        var v = List[Float32]()
+        for i in range(n):
+            # Only 64 distinct keys -> many ties.
+            k.append(Float32(Int(rng.unit() * 64.0)))
+            v.append(Float32(i))
+        cpu_sort_pairs(k, v)
+        assert_equal(len(k), n)
+        for i in range(1, n):
+            assert_true(k[i] >= k[i - 1], "keys must be non-decreasing")
+            if k[i] == k[i - 1]:
+                assert_true(v[i] > v[i - 1], "ties must keep input order")
+
+
 # ----------------------------------------------------------------------
 # inclusive / exclusive scan
 # ----------------------------------------------------------------------

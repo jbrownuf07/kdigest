@@ -233,10 +233,26 @@ def gpu_grouped_compress[
     num_keys: Int,
     compression: Float32,
 ) raises -> GroupedResult where (S.DT == _DT):
+    """Convenience overload: creates a `DeviceContext` for this call. Repeated
+    callers should hold one context and use the `ctx` overload."""
+    var ctx = DeviceContext()
+    return gpu_grouped_compress[S](ctx, keys, values, num_keys, compression)
+
+
+def gpu_grouped_compress[
+    S: ScaleFunction
+](
+    ctx: DeviceContext,
+    keys: List[Int32],
+    values: List[Float64],
+    num_keys: Int,
+    compression: Float32,
+) raises -> GroupedResult where (S.DT == _DT):
     """Compress a (key, value) batch into one centroid set per key on the GPU.
 
     `keys[i]` is a dense key id in `[0, num_keys)` for `values[i]`. Keys with no
-    samples yield empty centroid lists.
+    samples yield empty centroid lists. All device work (the one-block-per-key
+    launch and any oversized-key fallbacks) runs on the caller's `ctx`.
     """
     var result = GroupedResult()
     for _ in range(num_keys):
@@ -309,7 +325,7 @@ def gpu_grouped_compress[
             for j in range(lo, hi):
                 km.append(sorted_vals[j])
                 kw.append(Float32(1))
-            var part = gpu_compress_batch[S](km, kw, compression)
+            var part = gpu_compress_batch[S](ctx, km, kw, compression)
             result.means[k] = part[0].copy()
             result.weights[k] = part[1].copy()
 
@@ -319,7 +335,6 @@ def gpu_grouped_compress[
 
     # Build a compact launch: one block per small key. Remap to dense block ids
     # so block b handles small_keys[b]. The kernel reads a per-block offset pair.
-    var ctx = DeviceContext()
     var block_offsets = List[Int32](length=num_small + 1, fill=Int32(0))
     var flat = List[Float32]()
     var run = 0

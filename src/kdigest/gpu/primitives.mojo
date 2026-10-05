@@ -415,19 +415,87 @@ def gpu_compact(
 # ======================================================================
 
 
+comptime _INSERTION_RUN = 32
+
+
 def cpu_sort_pairs(mut keys: List[Float32], mut vals: List[Float32]):
-    """Stable-insertion sort of (keys, vals) ascending by key, in place."""
+    """Stable sort of (keys, vals) ascending by key, in place. O(n log n).
+
+    Bottom-up merge sort: insertion-sort fixed runs of `_INSERTION_RUN`
+    elements (fast on tiny ranges), then merge runs of doubling width through a
+    scratch buffer, ping-ponging between the two. Stable (ties keep input
+    order), which the GPU tests rely on when comparing against the bitonic sort.
+    This is on the host hot path of `gpu_compress_batch` / grouped compress, so
+    it must not be quadratic.
+    """
     var n = len(keys)
-    for i in range(1, n):
-        var k = keys[i]
-        var v = vals[i]
-        var j = i - 1
-        while j >= 0 and keys[j] > k:
-            keys[j + 1] = keys[j]
-            vals[j + 1] = vals[j]
-            j -= 1
-        keys[j + 1] = k
-        vals[j + 1] = v
+    if n < 2:
+        return
+
+    # 1. Insertion-sort each small run.
+    var start = 0
+    while start < n:
+        var end = min(start + _INSERTION_RUN, n)
+        for i in range(start + 1, end):
+            var k = keys[i]
+            var v = vals[i]
+            var j = i - 1
+            while j >= start and keys[j] > k:
+                keys[j + 1] = keys[j]
+                vals[j + 1] = vals[j]
+                j -= 1
+            keys[j + 1] = k
+            vals[j + 1] = v
+        start = end
+    if n <= _INSERTION_RUN:
+        return
+
+    # 2. Merge runs of doubling width, ping-ponging src <-> dst.
+    var src_k = keys.copy()
+    var src_v = vals.copy()
+    var dst_k = List[Float32](length=n, fill=Float32(0))
+    var dst_v = List[Float32](length=n, fill=Float32(0))
+    var width = _INSERTION_RUN
+    while width < n:
+        var lo = 0
+        while lo < n:
+            var mid = min(lo + width, n)
+            var hi = min(lo + 2 * width, n)
+            var a = lo
+            var b = mid
+            var o = lo
+            while a < mid and b < hi:
+                # `<=` takes from the left run on ties -> stable.
+                if src_k[a] <= src_k[b]:
+                    dst_k[o] = src_k[a]
+                    dst_v[o] = src_v[a]
+                    a += 1
+                else:
+                    dst_k[o] = src_k[b]
+                    dst_v[o] = src_v[b]
+                    b += 1
+                o += 1
+            while a < mid:
+                dst_k[o] = src_k[a]
+                dst_v[o] = src_v[a]
+                a += 1
+                o += 1
+            while b < hi:
+                dst_k[o] = src_k[b]
+                dst_v[o] = src_v[b]
+                b += 1
+                o += 1
+            lo = hi
+        var tk = src_k^
+        src_k = dst_k^
+        dst_k = tk^
+        var tv = src_v^
+        src_v = dst_v^
+        dst_v = tv^
+        width *= 2
+
+    keys = src_k^
+    vals = src_v^
 
 
 def cpu_inclusive_scan(mut data: List[Float32]):

@@ -16,6 +16,7 @@ Example:
 
 from std.sys import has_accelerator
 
+from max.gpu.host import DeviceContext
 from kdigest.scale import ScaleFunction, ScaleK1
 from kdigest.tdigest import TDigest
 from kdigest.gpu.grouped import gpu_grouped_compress
@@ -30,6 +31,9 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
     var num_keys: Int
     var compression: Float64
     var _digests: List[TDigest[Self.S]]
+    # One long-lived device context, created lazily on the first GPU batch and
+    # reused for every later batch (no per-call context creation).
+    var _ctx: Optional[DeviceContext]
 
     def __init__(out self, num_keys: Int, compression: Float64 = 100.0):
         self.num_keys = num_keys
@@ -37,6 +41,7 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
         self._digests = List[TDigest[Self.S]]()
         for _ in range(num_keys):
             self._digests.append(TDigest[Self.S](compression=compression))
+        self._ctx = None
 
     def add_batch(mut self, keys: List[Int32], values: List[Float64]) raises:
         """Fold a batch of `(key, value)` samples into their per-key digests.
@@ -65,8 +70,14 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
             if k < 0 or k >= self.num_keys:
                 raise Error("key out of range [0, num_keys)")
 
+        if not self._ctx:
+            self._ctx = DeviceContext()
         var res = gpu_grouped_compress[Self.S.F32](
-            keys, values, self.num_keys, Float32(self.compression)
+            self._ctx.value(),
+            keys,
+            values,
+            self.num_keys,
+            Float32(self.compression),
         )
         # Replace each key's digest with one wrapping the compressed centroids.
         var rebuilt = List[TDigest[Self.S]]()

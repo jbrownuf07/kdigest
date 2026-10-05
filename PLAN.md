@@ -450,18 +450,25 @@ documents the batch-size and key-count crossovers where GPU beats CPU.
   `bench/Benchmark.md` §4:**
   - *Accuracy:* the parallel GPU compress matches the CPU and is **sharper in the
     tail** (p99 rank error ~2e-5–5e-5 vs the CPU sweep's ~1e-4–3e-4).
-  - *Speed:* the current correctness-first backend is **~60–1600× slower** than
-    the CPU and shows **no crossover** in range — it is setup/transfer-bound
-    (per-call `DeviceContext`, host↔device `map_to_host`, serial host-side
-    tiling), not compute-bound. The per-call context creation also leaks Metal
-    command queues under tight loops.
-  - *Verdict / Open Design Question #5:* `add_batch` / `GroupedTDigest` keep
-    their conservative CPU fallback (50k crossover for `add_batch`) because the
-    GPU does not yet win on throughput. The value today is accuracy and a
-    correct, mergeable, GPU-resident data path (compress → query → merge).
-    Winning on speed is deferred future work: a **persistent `DeviceContext`**,
-    **device-resident buffers** across compress/query/merge, and a **parallel
-    multi-block sort** to replace the host-side tiling.
+  - *Speed (original 5f):* ~60–1600× slower than the CPU with no crossover.
+    The 5f write-up blamed per-call `DeviceContext` creation; **measured, that
+    is ~0.7 ms and was not the cause.** The real cost was `cpu_sort_pairs` — an
+    O(n²) insertion sort on the host hot path (65–80% of runtime) — plus five
+    fresh device buffers per 1,024-element tile.
+  - *Follow-up fix:* `cpu_sort_pairs` is now a stable O(n log n) bottom-up merge
+    sort; `gpu_compress_batch` allocates its device buffers once per call;
+    `gpu_compress_batch` / `gpu_grouped_compress` gained `ctx` overloads and
+    `GroupedTDigest` holds one long-lived context (which also fixes the Metal
+    command-queue exhaustion in tight loops). Result: batched GPU cost is flat
+    at ~4 µs/pt (37× faster at 1M) but still ~40× slower than CPU; grouped
+    one-block-per-key is at break-even (0.84–1.03× at ~1,000 samples/key). The
+    original grouped benchmark rows had 2,000 samples/key and so only ever
+    measured the oversized-key fallback.
+  - *Verdict / Open Design Question #5:* `add_batch` keeps its conservative CPU
+    fallback (50k crossover). Remaining deferred work to win on speed: launch
+    all first-pass tiles in **one multi-block kernel** instead of a per-tile
+    upload/launch/readback loop, keep intermediates **device-resident** across
+    reduction passes, and move the **sort onto the GPU**.
 
 ---
 

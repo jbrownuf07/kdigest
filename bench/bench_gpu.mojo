@@ -22,6 +22,8 @@ from std.math import abs
 from std.sys import has_accelerator
 from std.time import perf_counter_ns
 
+from max.gpu.host import DeviceContext
+
 from kdigest.scale import ScaleK2
 from kdigest.tdigest import TDigest
 from kdigest.gpu.add_batch import gpu_compress_batch
@@ -46,16 +48,9 @@ struct _Rng(Movable):
 
 
 def _sorted(data: List[Float64]) -> List[Float64]:
+    # Reference ordering for the exact quantiles (outside the timed regions).
     var xs = data.copy()
-    var n = len(xs)
-    # Simple insertion sort is fine for accuracy probes (<= a few 100k, run once).
-    for i in range(1, n):
-        var key = xs[i]
-        var j = i - 1
-        while j >= 0 and xs[j] > key:
-            xs[j + 1] = xs[j]
-            j -= 1
-        xs[j + 1] = key
+    sort(xs)
     return xs^
 
 
@@ -76,7 +71,7 @@ def _rank_err(
 # --- 1. Batched single-digest crossover --------------------------------------
 
 
-def _bench_batch_one(n: Int) raises:
+def _bench_batch_one(ctx: DeviceContext, n: Int) raises:
     var rng = _Rng(0xA11CE + UInt64(n))
     var raw32 = List[Float32]()
     var w32 = List[Float32]()
@@ -96,7 +91,9 @@ def _bench_batch_one(n: Int) raises:
 
     # GPU batched compress.
     var g_start = perf_counter_ns()
-    var comp = gpu_compress_batch[ScaleK2.F32](raw32, w32, Float32(COMPRESSION))
+    var comp = gpu_compress_batch[ScaleK2.F32](
+        ctx, raw32, w32, Float32(COMPRESSION)
+    )
     var g_elapsed = perf_counter_ns() - g_start
 
     # CPU add loop + merge.
@@ -144,21 +141,21 @@ def _bench_batch_one(n: Int) raises:
     )
 
 
-def _bench_batch_crossover() raises:
+def _bench_batch_crossover(ctx: DeviceContext) raises:
     print("Batched single-digest: GPU gpu_compress_batch vs CPU add-loop")
     print("   (ns per point; GPU wins where speedup > 1x)")
-    _bench_batch_one(1_000)
-    _bench_batch_one(10_000)
-    _bench_batch_one(50_000)
-    _bench_batch_one(100_000)
-    _bench_batch_one(500_000)
-    _bench_batch_one(1_000_000)
+    _bench_batch_one(ctx, 1_000)
+    _bench_batch_one(ctx, 10_000)
+    _bench_batch_one(ctx, 50_000)
+    _bench_batch_one(ctx, 100_000)
+    _bench_batch_one(ctx, 500_000)
+    _bench_batch_one(ctx, 1_000_000)
 
 
 # --- 2. Grouped multi-digest crossover ---------------------------------------
 
 
-def _bench_grouped_one(num_keys: Int, per_key: Int) raises:
+def _bench_grouped_one(ctx: DeviceContext, num_keys: Int, per_key: Int) raises:
     var rng = _Rng(0x6400 + UInt64(num_keys))
     var keys = List[Int32]()
     var values = List[Float64]()
@@ -170,7 +167,7 @@ def _bench_grouped_one(num_keys: Int, per_key: Int) raises:
     # GPU: one launch, one block per key.
     var g_start = perf_counter_ns()
     var _res = gpu_grouped_compress[ScaleK2.F32](
-        keys, values, num_keys, Float32(COMPRESSION)
+        ctx, keys, values, num_keys, Float32(COMPRESSION)
     )
     var g_elapsed = perf_counter_ns() - g_start
 
@@ -203,14 +200,22 @@ def _bench_grouped_one(num_keys: Int, per_key: Int) raises:
     )
 
 
-def _bench_grouped_crossover() raises:
+def _bench_grouped_crossover(ctx: DeviceContext) raises:
     print(
         "\nGrouped multi-digest: GPU gpu_grouped_compress vs CPU per-key loop"
     )
     print("   (ns per digest; one GPU block per key, single launch)")
-    _bench_grouped_one(16, 2_000)
-    _bench_grouped_one(64, 2_000)
-    _bench_grouped_one(256, 2_000)
+    print("   one-block path (samples/key <= BLOCK_CAP = 1024):")
+    _bench_grouped_one(ctx, 256, 1_000)
+    _bench_grouped_one(ctx, 1_024, 1_000)
+    _bench_grouped_one(ctx, 4_096, 1_000)
+    _bench_grouped_one(ctx, 4_096, 500)
+    _bench_grouped_one(ctx, 16_384, 500)
+    _bench_grouped_one(ctx, 16_384, 100)
+    _bench_grouped_one(ctx, 65_536, 100)
+    print("   oversized-key fallback (samples/key > BLOCK_CAP):")
+    _bench_grouped_one(ctx, 64, 2_000)
+    _bench_grouped_one(ctx, 256, 2_000)
 
 
 def main() raises:
@@ -218,5 +223,22 @@ def main() raises:
     if not has_accelerator():
         print("No accelerator present; skipping GPU benchmarks.")
         return
-    _bench_batch_crossover()
-    _bench_grouped_crossover()
+    # One device context for the whole run, reused by every call.
+    var ctx = DeviceContext()
+    # Warm-up: the first launch of each kernel pays one-time module load cost;
+    # keep it out of the timed rows.
+    var wm = List[Float32]()
+    var ww = List[Float32]()
+    for i in range(4_096):
+        wm.append(Float32(i))
+        ww.append(Float32(1))
+    _ = gpu_compress_batch[ScaleK2.F32](ctx, wm, ww, Float32(COMPRESSION))
+    var wk = List[Int32]()
+    var wv = List[Float64]()
+    for i in range(64):
+        wk.append(Int32(i % 4))
+        wv.append(Float64(i))
+    _ = gpu_grouped_compress[ScaleK2.F32](ctx, wk, wv, 4, Float32(COMPRESSION))
+
+    _bench_batch_crossover(ctx)
+    _bench_grouped_crossover(ctx)
