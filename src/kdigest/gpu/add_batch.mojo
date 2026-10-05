@@ -28,7 +28,7 @@ from std.math import ceildiv, floor
 
 from max.gpu import block_idx, global_idx, thread_idx
 from max.gpu.sync import barrier
-from max.gpu.host import DeviceBuffer, DeviceContext
+from max.gpu.host import DeviceBuffer, DeviceContext, HostBuffer
 from max.gpu.memory import AddressSpace
 from layout import TileTensor, TensorLayout, row_major, stack_allocation
 
@@ -348,8 +348,108 @@ def gpu_compress_batch_host_tiled[
 
 
 # ----------------------------------------------------------------------
-# Device-resident pipeline (step 3)
+# Device-resident pipeline
 # ----------------------------------------------------------------------
+
+
+struct CompressWorkspace(Movable):
+    """Reusable device buffers + pinned host staging for `gpu_compress_batch`.
+
+    Allocated once and grown (geometrically) to the largest batch seen, so
+    repeated calls pay no per-call allocation. Uploads/readbacks go through the
+    pinned host buffers with async copies, so a call synchronizes with the GPU
+    once at the end plus once per intermediate reduction pass (to learn the
+    survivor count) — instead of a blocking `map_to_host` per transfer."""
+
+    var capacity: Int  # max points
+    var tile_capacity: Int  # max tiles = ceildiv(capacity, BLOCK_CAP)
+    var keys_a: DeviceBuffer[_DT]
+    var keys_b: DeviceBuffer[_DT]
+    var w_in: DeviceBuffer[_DT]
+    var w_sorted: DeviceBuffer[_DT]
+    var idx_a: DeviceBuffer[_FLAG]
+    var idx_b: DeviceBuffer[_FLAG]
+    var counts: DeviceBuffer[_FLAG]  # tile_capacity + 1
+    var offsets: DeviceBuffer[_FLAG]  # tile_capacity + 1; [tiles] = total
+    var h_m: HostBuffer[_DT]  # capacity (upload staging)
+    var h_w: HostBuffer[_DT]
+    var h_out_m: HostBuffer[_DT]  # BLOCK_CAP (final centroids)
+    var h_out_w: HostBuffer[_DT]
+    var h_int: HostBuffer[_FLAG]  # 1 (survivor total / final count)
+
+    def __init__(out self, ctx: DeviceContext, capacity: Int = 0) raises:
+        var cap = max(capacity, BLOCK_CAP)
+        var tcap = ceildiv(cap, BLOCK_CAP)
+        self.capacity = cap
+        self.tile_capacity = tcap
+        self.keys_a = ctx.enqueue_create_buffer[_DT](cap)
+        self.keys_b = ctx.enqueue_create_buffer[_DT](cap)
+        self.w_in = ctx.enqueue_create_buffer[_DT](cap)
+        self.w_sorted = ctx.enqueue_create_buffer[_DT](cap)
+        self.idx_a = ctx.enqueue_create_buffer[_FLAG](cap)
+        self.idx_b = ctx.enqueue_create_buffer[_FLAG](cap)
+        self.counts = ctx.enqueue_create_buffer[_FLAG](tcap + 1)
+        self.offsets = ctx.enqueue_create_buffer[_FLAG](tcap + 1)
+        self.h_m = ctx.enqueue_create_host_buffer[_DT](cap)
+        self.h_w = ctx.enqueue_create_host_buffer[_DT](cap)
+        self.h_out_m = ctx.enqueue_create_host_buffer[_DT](BLOCK_CAP)
+        self.h_out_w = ctx.enqueue_create_host_buffer[_DT](BLOCK_CAP)
+        self.h_int = ctx.enqueue_create_host_buffer[_FLAG](1)
+        ctx.synchronize()  # host buffers must be ready before host writes
+
+    def reserve(mut self, ctx: DeviceContext, n: Int) raises:
+        """Ensure capacity for `n` points (grows to max(n, 2 * capacity))."""
+        if n <= self.capacity:
+            return
+        self = CompressWorkspace(ctx, max(n, 2 * self.capacity))
+
+
+def _scan_counts_kernel[
+    CL: TensorLayout
+](
+    counts: TileTensor[_FLAG, CL, MutAnyOrigin],
+    offsets: TileTensor[_FLAG, CL, MutAnyOrigin],
+    tiles: Int32,
+):
+    """Single block: `offsets[b] = sum(counts[0:b])` for b < tiles, and
+    `offsets[tiles] = total`. Each thread scans a contiguous chunk serially,
+    then the per-thread sums are scanned across the block (Hillis-Steele), so
+    any number of tiles fits in one launch."""
+    comptime assert counts.flat_rank == 1 and offsets.flat_rank == 1
+    var sums = stack_allocation[_FLAG, address_space=AddressSpace.SHARED](
+        _cap_f32
+    )
+    var tmp = stack_allocation[_FLAG, address_space=AddressSpace.SHARED](
+        _cap_f32
+    )
+    var tid = Int(thread_idx.x)
+    var t = Int(tiles)
+    var chunk = ceildiv(t, BLOCK_CAP)
+    var lo = min(tid * chunk, t)
+    var hi = min(lo + chunk, t)
+    var local = Int32(0)
+    for i in range(lo, hi):
+        local += rebind[Scalar[_FLAG]](counts[i])
+    sums[tid] = local
+    barrier()
+    var off = 1
+    while off < BLOCK_CAP:
+        if tid >= off:
+            tmp[tid] = rebind[Scalar[_FLAG]](sums[tid]) + rebind[Scalar[_FLAG]](
+                sums[tid - off]
+            )
+        else:
+            tmp[tid] = sums[tid]
+        barrier()
+        sums[tid] = tmp[tid]
+        barrier()
+        off *= 2
+    var run = rebind[Scalar[_FLAG]](sums[tid]) - local
+    for i in range(lo, hi):
+        offsets[i] = run
+        run += rebind[Scalar[_FLAG]](counts[i])
+    if tid == BLOCK_CAP - 1:
+        offsets[t] = sums[tid]
 
 
 def _gather_tiles_kernel[
@@ -382,6 +482,7 @@ def _device_compress_passes[
     S: ScaleFunction
 ](
     ctx: DeviceContext,
+    ws: CompressWorkspace,
     src_m: DeviceBuffer[_DT],
     src_w: DeviceBuffer[_DT],
     scratch_m: DeviceBuffer[_DT],
@@ -390,26 +491,24 @@ def _device_compress_passes[
     compression: Float32,
 ) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
     """Hierarchical compress of `n` mean-sorted pairs already on the device in
-    `src_*` (capacity >= n). Each pass is ONE multi-block launch (one block per
-    tile) into `scratch_*`, then a device-side gather packs the survivors back
-    into `src_*`. Per pass the host only reads the per-tile survivor counts
-    (one small sync) and uploads their prefix sums; the data itself never
-    leaves the GPU until the final <= BLOCK_CAP centroids are read back."""
-    var max_tiles = ceildiv(n, BLOCK_CAP)
+    `src_*`. Each pass: ONE multi-block compress launch into `scratch_*`, a
+    one-block scan of the per-tile survivor counts, and a gather that packs the
+    survivors back into `src_*` — all on the device. The host reads a single
+    integer per intermediate pass (the survivor total, to size the next launch)
+    and the final <= BLOCK_CAP centroids once at the end."""
     var layout = row_major(n)
-    var clayout = row_major(max_tiles)
-    var counts = ctx.enqueue_create_buffer[_FLAG](max_tiles)
-    var offsets = ctx.enqueue_create_buffer[_FLAG](max_tiles)
+    var clayout = row_major(ws.tile_capacity + 1)
     var t_src_m = TileTensor(src_m, layout)
     var t_src_w = TileTensor(src_w, layout)
     var t_scr_m = TileTensor(scratch_m, layout)
     var t_scr_w = TileTensor(scratch_w, layout)
-    var t_cnt = TileTensor(counts, clayout)
-    var t_off = TileTensor(offsets, clayout)
+    var t_cnt = TileTensor(ws.counts, clayout)
+    var t_off = TileTensor(ws.offsets, clayout)
 
     comptime compress = _compress_block_kernel[
         S, type_of(layout), type_of(clayout)
     ]
+    comptime scan = _scan_counts_kernel[type_of(clayout)]
     comptime gather = _gather_tiles_kernel[type_of(layout), type_of(clayout)]
 
     var m = n
@@ -427,28 +526,28 @@ def _device_compress_passes[
             block_dim=BLOCK_CAP,
         )
         if tiles == 1:
-            # Final block: read back only the surviving centroids.
-            var kept: Int
-            with counts.map_to_host() as hc:
-                kept = Int(rebind[Scalar[_FLAG]](TileTensor(hc, clayout)[0]))
+            # Final block: one async readback of count + centroids, one sync.
+            ctx.enqueue_copy(ws.h_int, ws.counts.create_sub_buffer[_FLAG](0, 1))
+            ctx.enqueue_copy(
+                ws.h_out_m.create_sub_buffer[_DT](0, m),
+                scratch_m.create_sub_buffer[_DT](0, m),
+            )
+            ctx.enqueue_copy(
+                ws.h_out_w.create_sub_buffer[_DT](0, m),
+                scratch_w.create_sub_buffer[_DT](0, m),
+            )
+            ctx.synchronize()
+            var kept = Int(ws.h_int[0])
             var out_m = List[Float32](capacity=kept)
             var out_w = List[Float32](capacity=kept)
-            with scratch_m.map_to_host() as hm, scratch_w.map_to_host() as hw:
-                var rm = TileTensor(hm, layout)
-                var rw = TileTensor(hw, layout)
-                for i in range(kept):
-                    out_m.append(rebind[Scalar[_DT]](rm[i]))
-                    out_w.append(rebind[Scalar[_DT]](rw[i]))
+            for i in range(kept):
+                out_m.append(ws.h_out_m[i])
+                out_w.append(ws.h_out_w[i])
             return (out_m^, out_w^)
 
-        # Survivor counts -> exclusive prefix sums (tiles values, tiny).
-        var survivors = 0
-        with counts.map_to_host() as hc, offsets.map_to_host() as ho:
-            var tc = TileTensor(hc, clayout)
-            var to = TileTensor(ho, clayout)
-            for b in range(tiles):
-                to[b] = Int32(survivors)
-                survivors += Int(rebind[Scalar[_FLAG]](tc[b]))
+        ctx.enqueue_function[scan](
+            t_cnt, t_off, Int32(tiles), grid_dim=1, block_dim=BLOCK_CAP
+        )
         ctx.enqueue_function[gather](
             t_scr_m,
             t_scr_w,
@@ -459,7 +558,60 @@ def _device_compress_passes[
             grid_dim=tiles,
             block_dim=BLOCK_CAP,
         )
-        m = survivors
+        # The only per-pass host sync: learn the survivor total.
+        ctx.enqueue_copy(
+            ws.h_int, ws.offsets.create_sub_buffer[_FLAG](tiles, 1)
+        )
+        ctx.synchronize()
+        m = Int(ws.h_int[0])
+
+
+def _stage_input(
+    ctx: DeviceContext,
+    h_m: HostBuffer[_DT],
+    h_w: HostBuffer[_DT],
+    means: List[Float32],
+    weights: List[Float32],
+    dst_m: DeviceBuffer[_DT],
+    dst_w: DeviceBuffer[_DT],
+) raises:
+    """Copy the batch into pinned host staging and enqueue async uploads."""
+    var n = len(means)
+    var pm = h_m.unsafe_ptr()
+    var pw = h_w.unsafe_ptr()
+    for i in range(n):
+        pm[i] = means[i]
+        pw[i] = weights[i]
+    ctx.enqueue_copy(
+        dst_m.create_sub_buffer[_DT](0, n), h_m.create_sub_buffer[_DT](0, n)
+    )
+    ctx.enqueue_copy(
+        dst_w.create_sub_buffer[_DT](0, n), h_w.create_sub_buffer[_DT](0, n)
+    )
+
+
+def gpu_compress_batch_host_sort[
+    S: ScaleFunction
+](
+    ctx: DeviceContext,
+    mut ws: CompressWorkspace,
+    means: List[Float32],
+    weights: List[Float32],
+    compression: Float32,
+) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
+    """Step 3, part A: host sort (O(n log n)) + device-resident tiling. Kept so
+    the benchmark and parity tests can isolate the GPU sort."""
+    var n = len(means)
+    if n == 0:
+        return (List[Float32](), List[Float32]())
+    var sm = means.copy()
+    var sw = weights.copy()
+    cpu_sort_pairs(sm, sw)
+    ws.reserve(ctx, n)
+    _stage_input(ctx, ws.h_m, ws.h_w, sm, sw, ws.keys_a, ws.w_sorted)
+    return _device_compress_passes[S](
+        ctx, ws, ws.keys_a, ws.w_sorted, ws.keys_b, ws.w_in, n, compression
+    )
 
 
 def gpu_compress_batch_host_sort[
@@ -470,42 +622,45 @@ def gpu_compress_batch_host_sort[
     weights: List[Float32],
     compression: Float32,
 ) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
-    """Step 3, part A: host sort (O(n log n)) + device-resident tiling. One
-    upload, one multi-block launch per pass, one readback. Kept for the
-    benchmark so the two halves of step 3 can be measured separately."""
-    var n = len(means)
-    if n == 0:
-        return (List[Float32](), List[Float32]())
-    var sm = means.copy()
-    var sw = weights.copy()
-    cpu_sort_pairs(sm, sw)
-
-    var src_m = ctx.enqueue_create_buffer[_DT](n)
-    var src_w = ctx.enqueue_create_buffer[_DT](n)
-    var scr_m = ctx.enqueue_create_buffer[_DT](n)
-    var scr_w = ctx.enqueue_create_buffer[_DT](n)
-    var layout = row_major(n)
-    with src_m.map_to_host() as hm, src_w.map_to_host() as hw:
-        var tm = TileTensor(hm, layout)
-        var tw = TileTensor(hw, layout)
-        for i in range(n):
-            tm[i] = sm[i]
-            tw[i] = sw[i]
-    return _device_compress_passes[S](
-        ctx, src_m, src_w, scr_m, scr_w, n, compression
-    )
+    var ws = CompressWorkspace(ctx, len(means))
+    return gpu_compress_batch_host_sort[S](ctx, ws, means, weights, compression)
 
 
 def gpu_compress_batch[
     S: ScaleFunction
 ](
-    means: List[Float32], weights: List[Float32], compression: Float32
+    ctx: DeviceContext,
+    mut ws: CompressWorkspace,
+    means: List[Float32],
+    weights: List[Float32],
+    compression: Float32,
 ) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
-    """Convenience overload: creates a `DeviceContext` for this call. Callers
-    that compress repeatedly should create one context and use the
-    `gpu_compress_batch[S](ctx, ...)` overload instead."""
-    var ctx = DeviceContext()
-    return gpu_compress_batch[S](ctx, means, weights, compression)
+    """Compress an arbitrary-length (mean, weight) set into t-digest centroids
+    on the GPU, using scale function `S`, the caller's `ctx`, and a reusable
+    workspace `ws` (the fast path for repeated calls).
+
+    Fully device-resident: one async upload, a stable GPU sort
+    (`kdigest.gpu.sort`), then the hierarchical compress passes (compress,
+    scan, gather — all on the device). The host synchronizes once per
+    intermediate pass (one integer) and once for the final <= BLOCK_CAP
+    centroids. Output is identical to `gpu_compress_batch_host_tiled`."""
+    var n = len(means)
+    if n == 0:
+        return (List[Float32](), List[Float32]())
+    ws.reserve(ctx, n)
+    _stage_input(ctx, ws.h_m, ws.h_w, means, weights, ws.keys_a, ws.w_in)
+    var sorted_in_a = gpu_sort_by_mean(
+        ctx, ws.keys_a, ws.keys_b, ws.idx_a, ws.idx_b, ws.w_in, ws.w_sorted, n
+    )
+    # Sorted (mean, weight) now live in (keys_?, w_sorted); the other key
+    # buffer and w_in serve as the passes' scratch.
+    if sorted_in_a:
+        return _device_compress_passes[S](
+            ctx, ws, ws.keys_a, ws.w_sorted, ws.keys_b, ws.w_in, n, compression
+        )
+    return _device_compress_passes[S](
+        ctx, ws, ws.keys_b, ws.w_sorted, ws.keys_a, ws.w_in, n, compression
+    )
 
 
 def gpu_compress_batch[
@@ -516,42 +671,17 @@ def gpu_compress_batch[
     weights: List[Float32],
     compression: Float32,
 ) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
-    """Compress an arbitrary-length (mean, weight) set into t-digest centroids
-    on the GPU, using scale function `S` and the caller's `ctx`.
+    """One-shot overload: allocates a workspace for this call. Repeated callers
+    should hold a `CompressWorkspace` (or a `GpuSession`) and reuse it."""
+    var ws = CompressWorkspace(ctx, len(means))
+    return gpu_compress_batch[S](ctx, ws, means, weights, compression)
 
-    Fully device-resident (step 3): one upload of the raw (mean, weight)
-    pairs, a stable GPU sort (`kdigest.gpu.sort`), then the hierarchical
-    compress passes — each one multi-block launch plus a device-side gather.
-    The host reads back only per-pass tile survivor counts and the final
-    <= BLOCK_CAP centroids. Output is identical to the host-sorted reference
-    path (`gpu_compress_batch_host_tiled`)."""
-    var n = len(means)
-    if n == 0:
-        return (List[Float32](), List[Float32]())
 
-    var layout = row_major(n)
-    var keys_a = ctx.enqueue_create_buffer[_DT](n)
-    var keys_b = ctx.enqueue_create_buffer[_DT](n)
-    var idx_a = ctx.enqueue_create_buffer[DType.int32](n)
-    var idx_b = ctx.enqueue_create_buffer[DType.int32](n)
-    var w_in = ctx.enqueue_create_buffer[_DT](n)
-    var w_sorted = ctx.enqueue_create_buffer[_DT](n)
-    with keys_a.map_to_host() as hm, w_in.map_to_host() as hw:
-        var tm = TileTensor(hm, layout)
-        var tw = TileTensor(hw, layout)
-        for i in range(n):
-            tm[i] = means[i]
-            tw[i] = weights[i]
-
-    var sorted_in_a = gpu_sort_by_mean(
-        ctx, keys_a, keys_b, idx_a, idx_b, w_in, w_sorted, n
-    )
-    # Sorted (mean, weight) now live in (keys_?, w_sorted); the other key
-    # buffer and w_in are free to serve as the passes' scratch.
-    if sorted_in_a:
-        return _device_compress_passes[S](
-            ctx, keys_a, w_sorted, keys_b, w_in, n, compression
-        )
-    return _device_compress_passes[S](
-        ctx, keys_b, w_sorted, keys_a, w_in, n, compression
-    )
+def gpu_compress_batch[
+    S: ScaleFunction
+](
+    means: List[Float32], weights: List[Float32], compression: Float32
+) raises -> Tuple[List[Float32], List[Float32]] where (S.DT == _DT):
+    """Convenience overload: creates a `DeviceContext` and workspace."""
+    var ctx = DeviceContext()
+    return gpu_compress_batch[S](ctx, means, weights, compression)

@@ -18,6 +18,9 @@ from std.sys import has_accelerator
 from std.testing import assert_true, TestSuite
 
 from kdigest import TDigest, ScaleK2, GroupedTDigest
+from kdigest.gpu.add_batch import gpu_compress_batch_host_tiled
+from kdigest.gpu.grouped import gpu_grouped_compress, GroupedWorkspace
+from max.gpu.host import DeviceContext
 
 
 comptime COMPRESSION = 100.0
@@ -171,6 +174,59 @@ def test_grouped_mixed_sizes() raises:
                 _abs(gq - tq) <= band,
                 String("mixed key ", k, " q=", q, " truth=", tq, " gpu=", gq),
             )
+
+
+def test_grouped_matches_per_key_reference_exactly() raises:
+    # Each block sorts its own key in shared memory now (no host sort), and
+    # writes compactly at its input offset. Each key's centroids must equal the
+    # single-digest reference path run on that key alone, bit for bit — across
+    # interleaved keys, empty keys, a key of exactly BLOCK_CAP, tied values,
+    # an oversized key, and a reused (shrinking then growing) workspace.
+    comptime if not has_accelerator():
+        return
+    var ctx = DeviceContext()
+    var ws = GroupedWorkspace(ctx)
+    var cfgs = [(50, 300, 0), (40, 1024, 13), (6, 2500, 0), (300, 1, 0)]
+    for c in range(len(cfgs)):
+        var nk = cfgs[c][0]
+        var per = cfgs[c][1]
+        var lev = cfgs[c][2]
+        var rng = _Rng(UInt64(0xBEE + c))
+        var keys = List[Int32]()
+        var vals = List[Float64]()
+        for i in range(per):
+            for k in range(nk):
+                if k % 7 == 3:
+                    continue  # empty key
+                if k % 5 == 1 and i >= per // 3:
+                    continue  # smaller key
+                var u = rng.unit()
+                keys.append(Int32(k))
+                vals.append(
+                    Float64(Int(u * Float64(lev))) if lev
+                    > 0 else u * Float64(k + 1)
+                )
+        var res = gpu_grouped_compress[ScaleK2.F32](
+            ctx, ws, keys, vals, nk, Float32(COMPRESSION)
+        )
+        for k in range(nk):
+            var km = List[Float32]()
+            var kw = List[Float32]()
+            for i in range(len(keys)):
+                if Int(keys[i]) == k:
+                    km.append(Float32(vals[i]))
+                    kw.append(Float32(1))
+            var tag = String("cfg=", c, " key=", k)
+            if len(km) == 0:
+                assert_true(len(res.means[k]) == 0, "empty key " + tag)
+                continue
+            var r = gpu_compress_batch_host_tiled[ScaleK2.F32](
+                ctx, km, kw, Float32(COMPRESSION)
+            )
+            assert_true(len(r[0]) == len(res.means[k]), "count " + tag)
+            for j in range(len(r[0])):
+                assert_true(r[0][j] == res.means[k][j], "mean " + tag)
+                assert_true(r[1][j] == res.weights[k][j], "weight " + tag)
 
 
 def test_grouped_cpu_fallback_runs() raises:

@@ -16,7 +16,7 @@ Example:
 
 from std.sys import has_accelerator
 
-from max.gpu.host import DeviceContext
+from kdigest.gpu.session import GpuSession
 from kdigest.scale import ScaleFunction, ScaleK1
 from kdigest.tdigest import TDigest
 from kdigest.gpu.grouped import gpu_grouped_compress
@@ -31,9 +31,9 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
     var num_keys: Int
     var compression: Float64
     var _digests: List[TDigest[Self.S]]
-    # One long-lived device context, created lazily on the first GPU batch and
-    # reused for every later batch (no per-call context creation).
-    var _ctx: Optional[DeviceContext]
+    # One long-lived GPU session (device context + reusable workspaces),
+    # created lazily on the first GPU batch and reused for every later batch.
+    var _session: Optional[GpuSession]
 
     def __init__(out self, num_keys: Int, compression: Float64 = 100.0):
         self.num_keys = num_keys
@@ -41,7 +41,7 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
         self._digests = List[TDigest[Self.S]]()
         for _ in range(num_keys):
             self._digests.append(TDigest[Self.S](compression=compression))
-        self._ctx = None
+        self._session = None
 
     def add_batch(mut self, keys: List[Int32], values: List[Float64]) raises:
         """Fold a batch of `(key, value)` samples into their per-key digests.
@@ -70,10 +70,12 @@ struct GroupedTDigest[S: ScaleFunction](Movable) where (
             if k < 0 or k >= self.num_keys:
                 raise Error("key out of range [0, num_keys)")
 
-        if not self._ctx:
-            self._ctx = DeviceContext()
+        if not self._session:
+            self._session = GpuSession()
+        ref session = self._session.value()
         var res = gpu_grouped_compress[Self.S.F32](
-            self._ctx.value(),
+            session.ctx,
+            session.ws,
             keys,
             values,
             self.num_keys,

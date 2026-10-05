@@ -475,6 +475,23 @@ documents the batch-size and key-count crossovers where GPU beats CPU.
     `_GPU_CROSSOVER` raised from the provisional 50k to 150k. Remaining fixed
     cost (~3 ms per call: buffer allocation + per-pass syncs) is what keeps
     small batches on the CPU.
+  - *Fixed-cost work (after step 3):*
+    - **Per-pass offsets on the device.** `_scan_counts_kernel` computes them;
+      the host reads one integer per pass.
+    - **Reusable workspaces.** `CompressWorkspace` / `GroupedWorkspace` use
+      pinned staging and async copies, and are exposed through `GpuSession`
+      (`TDigest.add_batch(values, session)`; `GroupedTDigest` holds one).
+    - **Grouped path.** Each block sorts its own key in shared memory, output
+      is written compactly, and the host does two linear passes with one sync.
+
+    Fixed cost per call dropped from ~3.4 ms to ~0.9 ms. Single-digest
+    crossover is now **~40k (session) / ~60k (one-shot)**, up to ~2× the CPU.
+    Grouped one-block-per-key is **2.5–4.3×** faster at 500–1,000 samples/key.
+    `_GPU_CROSSOVER` is set to 60k and `_GPU_CROSSOVER_SESSION` to 40k. Still
+    open:
+    - Batch oversized keys into one segmented launch (the fallback is ~0.19×).
+    - Cut the per-key host bookkeeping that keeps tiny-key grouped batches on
+      the CPU.
 
 ---
 

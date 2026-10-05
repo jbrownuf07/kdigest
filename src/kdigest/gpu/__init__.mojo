@@ -21,10 +21,16 @@ from kdigest.gpu.primitives import (
 )
 from kdigest.gpu.scale_device import gpu_scale_eval
 from kdigest.gpu.add_batch import (
+    CompressWorkspace,
     gpu_compress_batch,
     gpu_compress_batch_host_sort,
     gpu_compress_batch_host_tiled,
 )
 from kdigest.gpu.sort import gpu_sort_by_mean
-from kdigest.gpu.grouped import gpu_grouped_compress, GroupedResult
+from kdigest.gpu.grouped import (
+    gpu_grouped_compress,
+    GroupedResult,
+    GroupedWorkspace,
+)
+from kdigest.gpu.session import GpuSession
 from kdigest.gpu.query import gpu_quantile, gpu_cdf, gpu_merge_digests

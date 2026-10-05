@@ -22,3 +22,4 @@ from kdigest.scale import (
 )
 from kdigest.tdigest import TDigest
 from kdigest.grouped import GroupedTDigest
+from kdigest.gpu.session import GpuSession

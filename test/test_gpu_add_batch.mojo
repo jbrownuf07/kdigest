@@ -25,6 +25,7 @@ from std.sys import has_accelerator
 from std.testing import assert_true, TestSuite
 
 from kdigest import TDigest, ScaleK0, ScaleK1, ScaleK2, ScaleK3, Decay
+from kdigest import GpuSession
 from kdigest.scale import ScaleFunction
 from kdigest.gpu.add_batch import (
     gpu_compress_batch,
@@ -330,6 +331,39 @@ def test_device_pipeline_matches_reference() raises:
     for i in range(len(sizes)):
         _check_paths_identical(ctx, sizes[i], 0, UInt64(0x51 + i))
         _check_paths_identical(ctx, sizes[i], 37, UInt64(0x77 + i))
+
+
+def test_session_reuse_matches_one_shot() raises:
+    # A reused GpuSession (workspace grown across calls, then reused at a
+    # smaller size) must give exactly the same centroids as fresh one-shot calls.
+    comptime if not has_accelerator():
+        return
+    var session = GpuSession()
+    var sizes = [2_000, 300_000, 1_500, 80_000]
+    for i in range(len(sizes)):
+        var data = _uniform(sizes[i], UInt64(0xA0 + i))
+        var m = List[Float32]()
+        var w = List[Float32]()
+        for j in range(len(data)):
+            m.append(Float32(data[j]))
+            w.append(Float32(1))
+        var a = gpu_compress_batch[ScaleK2.F32](
+            session.ctx, session.ws.batch, m, w, 100.0
+        )
+        var b = gpu_compress_batch[ScaleK2.F32](m, w, 100.0)
+        assert_true(len(a[0]) == len(b[0]), "session count")
+        for j in range(len(a[0])):
+            assert_true(a[0][j] == b[0][j], "session mean")
+            assert_true(a[1][j] == b[1][j], "session weight")
+    # The session overload of TDigest.add_batch agrees with the default one.
+    var data = _uniform(200_000, 0xA9)
+    var d1 = TDigest[ScaleK2](compression=COMPRESSION)
+    var d2 = TDigest[ScaleK2](compression=COMPRESSION)
+    d1.add_batch(data)
+    d2.add_batch(data, session)
+    assert_true(len(d1) == len(d2), "add_batch session centroid count")
+    for q in [0.001, 0.5, 0.999]:
+        assert_true(d1.quantile(q) == d2.quantile(q), "add_batch session q")
 
 
 def test_add_batch_below_crossover_matches_add() raises:

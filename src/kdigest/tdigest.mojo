@@ -31,6 +31,7 @@ comptime _Centroid = Centroid[DType.float64]
 from kdigest.decay import Decay
 from kdigest.scale import ScaleFunction, ScaleK1
 from kdigest.gpu.add_batch import gpu_compress_batch
+from kdigest.gpu.session import GpuSession
 
 
 # Buffer size as a multiple of compression. The reference uses a buffer several
@@ -46,10 +47,13 @@ comptime _RENORM_LOG_THRESHOLD = 400.0
 comptime _PRUNE_EPSILON = 1e-6
 
 # add_batch dispatches to the GPU only above this batch size; below it the fixed
-# launch / transfer cost dominates, so the CPU buffer path is faster. Measured
-# in bench/bench_gpu.mojo (Apple silicon, device-resident pipeline): the GPU is
-# 0.89x the CPU at 100k points and 1.21x at 200k, so break-even sits in between.
-comptime _GPU_CROSSOVER = 150_000
+# per-call cost (device context + workspace allocation, a few GPU syncs) wins
+# and the CPU buffer path is faster. Measured in bench/bench_gpu.mojo (Apple
+# silicon): one-shot GPU is 0.98x the CPU at 50k points and 1.54x at 100k.
+comptime _GPU_CROSSOVER = 60_000
+# With a caller-held `GpuSession` the context and workspace are reused, so the
+# GPU wins sooner: 0.78x at 30k, 1.27x at 50k.
+comptime _GPU_CROSSOVER_SESSION = 40_000
 
 # Serialization format version, written as the first byte of `to_bytes`.
 comptime _SERDE_VERSION: UInt8 = 1
@@ -194,7 +198,30 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
             for i in range(n):
                 self.add(values[i])
             return
+        var session = GpuSession()
+        self._add_batch_gpu(values, session)
 
+    def add_batch(
+        mut self, values: List[Float64], mut session: GpuSession
+    ) raises where Self.S.F32.DT == DType.float32:
+        """`add_batch` reusing a caller-held `GpuSession` (device context +
+        workspaces), so repeated batches pay no per-call setup. Because that
+        fixed cost is gone, the GPU is used from a lower batch size
+        (`_GPU_CROSSOVER_SESSION`)."""
+        var n = len(values)
+        if n == 0:
+            return
+        comptime gpu_available = has_accelerator()
+        if not gpu_available or n < _GPU_CROSSOVER_SESSION:
+            for i in range(n):
+                self.add(values[i])
+            return
+        self._add_batch_gpu(values, session)
+
+    def _add_batch_gpu(
+        mut self, values: List[Float64], mut session: GpuSession
+    ) raises where Self.S.F32.DT == DType.float32:
+        var n = len(values)
         # Validate up front (the GPU kernel assumes finite inputs).
         for i in range(n):
             self._validate(values[i], 1.0)
@@ -241,7 +268,11 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
                 self._max = vmax
 
         var out = gpu_compress_batch[Self.S.F32](
-            means, weights, Float32(self.compression)
+            session.ctx,
+            session.ws.batch,
+            means,
+            weights,
+            Float32(self.compression),
         )
         var new_centroids = List[_Centroid]()
         var total = 0.0
