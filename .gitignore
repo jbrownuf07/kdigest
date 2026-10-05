@@ -1,0 +1,9 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# Agent tooling / skills (developer environment, not project source)
+.agents/
+.claude/
+.goose/
+skills-lock.json
