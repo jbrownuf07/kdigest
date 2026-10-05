@@ -8,6 +8,7 @@ See README.md for an overview and PLAN.md for the implementation roadmap.
 """
 
 from kdigest.centroid import Centroid
+from kdigest.decay import Decay
 from kdigest.scale import (
     ScaleFunction,
     ScaleK0,
