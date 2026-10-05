@@ -15,5 +15,9 @@ from kdigest.scale import (
     ScaleK1,
     ScaleK2,
     ScaleK3,
+    ScaleK0Impl,
+    ScaleK1Impl,
+    ScaleK2Impl,
+    ScaleK3Impl,
 )
 from kdigest.tdigest import TDigest

@@ -3,20 +3,28 @@
 Each centroid tracks the mean of a cluster of samples and the total effective
 weight (count) of that cluster. Weights may be fractional once exponential
 decay is applied (Phase 3).
+
+Generic over a `DType` (Phase 5a) so the same type serves the Float64 CPU
+reference and the Float32 GPU backend; the default is `float64`, so bare
+`Centroid` is `Centroid[float64]` and existing call sites are unchanged.
 """
 
 
 @fieldwise_init
-struct Centroid(ImplicitlyCopyable, Movable, Writable):
-    var mean: Float64
-    var weight: Float64
+struct Centroid[dtype: DType = DType.float64](
+    ImplicitlyCopyable, Movable, Writable
+):
+    var mean: Scalar[Self.dtype]
+    var weight: Scalar[Self.dtype]
 
     @staticmethod
-    def singleton(value: Float64) -> Centroid:
+    def singleton(value: Scalar[Self.dtype]) -> Centroid[Self.dtype]:
         """A centroid holding a single unit-weight sample."""
-        return Centroid(mean=value, weight=1.0)
+        return Centroid[Self.dtype](mean=value, weight=1.0)
 
-    def add_sample(mut self, value: Float64, sample_weight: Float64):
+    def add_sample(
+        mut self, value: Scalar[Self.dtype], sample_weight: Scalar[Self.dtype]
+    ):
         """Fold one weighted sample into this centroid.
 
         Uses the numerically stable incremental weighted-mean update
@@ -27,7 +35,7 @@ struct Centroid(ImplicitlyCopyable, Movable, Writable):
         self.mean += (value - self.mean) * (sample_weight / new_weight)
         self.weight = new_weight
 
-    def merge(mut self, other: Centroid):
+    def merge(mut self, other: Centroid[Self.dtype]):
         """Fold another centroid's mass into this one."""
         self.add_sample(other.mean, other.weight)
 

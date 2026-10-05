@@ -211,15 +211,18 @@ the correctness reference. Mojo targets GPUs directly (see the
   NVIDIA/AMD lanes.)
 - **Order of attack.** Build single-digest `add_batch` first (it establishes the
   primitives and the parity harness on the simplest shape), *then* the grouped
-  multi-digest kernel (the biggest real-world payoff).
+  multi-digest kernel.
 
-**Float32 path (new decision).** Phase 1–4 are `Float64`. GPUs — especially the
-Apple silicon dev box — are far happier in `Float32`, so the GPU backend targets
-`Float32` first. To avoid forking the math, parameterize the scale functions and
-centroid over a `DType` (defaulting to `float64` on CPU, `float32` on GPU). The
-CPU reference keeps `Float64`; parity tolerances account for the fp32 vs fp64 gap
-(looser than the fp64-vs-fp64 bound, tracked per scale function). If the GPU path
-does not pan out, the `DType` parameter is dropped and we revert to `Float64`.
+**Float32 path (new decision).** Phase 1–4 are `Float64`. Consumer and
+Apple-silicon GPUs deliver substantially higher `Float32` throughput than
+`Float64` — on Apple silicon, `Float64` is not natively supported in hardware
+and is emulated, so `Float32` is effectively required — so the GPU backend
+targets `Float32` first. To avoid forking the math, parameterize the scale
+functions and centroid over a `DType` (defaulting to `float64` on CPU, `float32`
+on GPU). The CPU reference keeps `Float64`; parity tolerances account for the
+fp32 vs fp64 gap (looser than the fp64-vs-fp64 bound, tracked per scale
+function). If the GPU path does not pan out, the `DType` parameter is dropped and
+we revert to `Float64`.
 
 **Where the GPU does *not* help**
 
@@ -230,7 +233,7 @@ does not pan out, the `DType` parameter is dropped and we revert to `Float64`.
 
 ---
 
-### Stage 5a — DType generalization (CPU, no GPU yet)
+### Stage 5a — DType generalization (CPU, no GPU yet) ✅ DONE
 
 Prepare the math core for a device port without touching behavior.
 
@@ -242,6 +245,20 @@ Prepare the math core for a device port without touching behavior.
 
 **Done when:** `TDigest` still passes all Phase 1–4 tests at `float64`, and a
 `float32` instantiation passes a looser-tolerance parity test on CPU.
+
+**Outcome.** `Centroid[dtype: DType = .float64]` and the generic scale structs
+`ScaleK0Impl..K3Impl[dtype: DType = .float64]` are DType-parameterized; the
+public names `ScaleK0..K3` are Float64 `comptime` aliases of those structs, so
+`TDigest[ScaleK1]` and every other call site compile unchanged. The
+`ScaleFunction` trait carries an associated `comptime DT: DType`; floating-point
+math inside each method is unlocked with `comptime assert DT.is_floating_point()`,
+and `_clamp_q` uses a dtype-sized epsilon (1e-7 for fp32, 1e-15 for fp64).
+`TDigest` stays Float64-only via `where S.DT == DType.float64`, bridging the
+nominal `S.DT` to concrete `Float64` through two tiny `_normalizer`/`_k` wrappers
+(justified `rebind`s under the `where` proof). All 53 Phase 1–4 tests pass
+unchanged; 10 new float32 parity tests (round-trip, monotonicity, tail
+steepness, and a direct f32-vs-f64 forward-map check) pass at atol=1e-4, for 63
+tests total.
 
 ---
 

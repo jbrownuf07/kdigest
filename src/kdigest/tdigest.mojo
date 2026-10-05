@@ -23,6 +23,10 @@ from std.math import exp, isnan, isinf
 from std.memory import bitcast
 
 from kdigest.centroid import Centroid
+
+# Stage 5a: TDigest remains Float64-only; the GPU Float32 port lands in Stage
+# 5d. Bind the (now DType-generic) Centroid to float64 for use here.
+comptime _Centroid = Centroid[DType.float64]
 from kdigest.decay import Decay
 from kdigest.scale import ScaleFunction, ScaleK1
 
@@ -43,7 +47,7 @@ comptime _PRUNE_EPSILON = 1e-6
 comptime _SERDE_VERSION: UInt8 = 1
 
 
-def _sort_centroids(mut cs: List[Centroid]):
+def _sort_centroids(mut cs: List[_Centroid]):
     """In-place sort of centroids by mean (insertion sort).
 
     Insertion sort is used because after a merge the kept centroids are already
@@ -76,8 +80,15 @@ def _get_f64(data: List[UInt8], offset: Int) raises -> Float64:
     return bitcast[DType.float64, 1](bits)
 
 
-struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
+struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
+    S.DT == DType.float64
+):
     """A merging t-digest with a pluggable scale function `S`.
+
+    Stage 5a note: this CPU digest is Float64-only (`where S.DT == float64`).
+    The scale function is DType-generic for the Float32 GPU backend (Stage 5d),
+    but here `S` is constrained to Float64 so the hot-path math stays in one
+    precision.
 
     When a `Decay` with λ > 0 is supplied, centroid weights decay exponentially
     with the digest's clock. Decay is applied lazily: each centroid stores its
@@ -93,9 +104,9 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
     var _decay: Decay
     # Merged, mean-sorted centroids. Their `weight` fields hold *scaled* weights
     # (actual · e^(λ·t_insert)) when decay is active, raw weights otherwise.
-    var _centroids: List[Centroid]
+    var _centroids: List[_Centroid]
     # Unmerged incoming samples awaiting the next merge pass (also scaled).
-    var _buffer: List[Centroid]
+    var _buffer: List[_Centroid]
     var _buffer_limit: Int
     # Sum of scaled weights across centroids + buffer; effective total is
     # `_stored_total · e^(-_log_scale)`.
@@ -116,8 +127,8 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
         self.compression = compression
         self._scale = scale
         self._decay = decay
-        self._centroids = List[Centroid]()
-        self._buffer = List[Centroid]()
+        self._centroids = List[_Centroid]()
+        self._buffer = List[_Centroid]()
         self._buffer_limit = Int(compression) * _BUFFER_FACTOR
         self._stored_total = 0.0
         self._log_scale = 0.0
@@ -178,7 +189,7 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
                 self._max = value
 
         var scaled = weight * self._scale_factor()
-        self._buffer.append(Centroid(mean=value, weight=scaled))
+        self._buffer.append(_Centroid(mean=value, weight=scaled))
         self._stored_total += scaled
 
         if len(self._buffer) >= self._buffer_limit:
@@ -211,6 +222,18 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
             return self._stored_total
         return self._stored_total * exp(-self._log_scale)
 
+    # Float64 wrappers over the DType-generic scale function. `where S.DT ==
+    # float64` guarantees these rebinds are identities (not reinterpretations).
+    def _normalizer(self, compression: Float64, n: Float64) -> Float64:
+        var c = rebind[Scalar[Self.S.DT]](compression)
+        var nn = rebind[Scalar[Self.S.DT]](n)
+        return rebind[Float64](self._scale.normalizer(c, nn))
+
+    def _k(self, q: Float64, nrm: Float64) -> Float64:
+        var qq = rebind[Scalar[Self.S.DT]](q)
+        var nn = rebind[Scalar[Self.S.DT]](nrm)
+        return rebind[Float64](self._scale.k(qq, nn))
+
     def merge(mut self):
         """Compress the buffer into the main centroid list via the merge pass.
         """
@@ -221,7 +244,7 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
         var work = self._centroids.copy()
         for i in range(len(self._buffer)):
             work.append(self._buffer[i])
-        self._buffer = List[Centroid]()
+        self._buffer = List[_Centroid]()
         _sort_centroids(work)
 
         if len(work) == 0:
@@ -232,9 +255,9 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
         # the decay scale factor cancels. Use the stored total for the ratios.
         var effective_n = self._effective_count()
         var stored_n = self._stored_total
-        var nrm = self._scale.normalizer(self.compression, effective_n)
+        var nrm = self._normalizer(self.compression, effective_n)
 
-        var merged = List[Centroid]()
+        var merged = List[_Centroid]()
         var current = work[0]
         # Stored weight to the left of (and not including) the current cluster.
         var weight_so_far = 0.0
@@ -246,9 +269,7 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
             var q_right = (
                 weight_so_far + current.weight + candidate.weight
             ) / stored_n
-            var k_span = self._scale.k(q_right, nrm) - self._scale.k(
-                q_left, nrm
-            )
+            var k_span = self._k(q_right, nrm) - self._k(q_left, nrm)
             # Always coalesce exact-tie means (e.g. all-identical streams), and
             # otherwise grow the cluster while it fits in the k-size budget.
             if candidate.mean == current.mean or k_span <= 1.0:
@@ -271,7 +292,7 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
         we compare stored weight against a scaled floor.
         """
         var stored_floor = _PRUNE_EPSILON * exp(self._log_scale)
-        var kept = List[Centroid]()
+        var kept = List[_Centroid]()
         var removed = 0.0
         for i in range(len(self._centroids)):
             if self._centroids[i].weight >= stored_floor:
@@ -514,7 +535,7 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
             off += 8
             var weight = _get_f64(data, off)
             off += 8
-            result._centroids.append(Centroid(mean=mean, weight=weight))
+            result._centroids.append(_Centroid(mean=mean, weight=weight))
         result._log_scale = log_scale
         result._clock = clock
         result._stored_total = stored_total
