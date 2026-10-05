@@ -19,3 +19,4 @@ from kdigest.gpu.primitives import (
     cpu_segmented_scan,
     cpu_compact,
 )
+from kdigest.gpu.scale_device import gpu_scale_eval

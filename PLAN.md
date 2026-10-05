@@ -300,7 +300,7 @@ across lengths {0,1,2,13,31,63,64,65,100,511,512,1000,1024} (fp32 scans within
 
 ---
 
-### Stage 5c — Scale functions as device functions
+### Stage 5c — Scale functions as device functions ✅ DONE
 
 - Express `k(q)`, `q(k)`, `normalizer(...)` as per-thread device functions
   reusing the exact Phase 1 formulas (one source of truth, two call sites).
@@ -309,6 +309,19 @@ across lengths {0,1,2,13,31,63,64,65,100,511,512,1000,1024} (fp32 scans within
 
 **Done when:** on-device scale evaluation matches the CPU trait within fp32
 tolerance for all four functions.
+
+**Outcome.** No new math: the DType-generic `ScaleFunction` structs from Phase 5a
+compile to device code unchanged, so a kernel just instantiates
+`ScaleKnImpl[float32]` and calls `.normalizer()/.k()/.q()` directly — literally
+one source of truth, two call sites. `gpu/scale_device.mojo` adds a generic
+kernel `_scale_eval_kernel[S: ScaleFunction, Layout]` (bound before
+`enqueue_function`) and a host wrapper `gpu_scale_eval[S](qs, compression,
+count)` returning `(k(q), q(k(q)))`. As in the CPU digest, the nominal `S.DT` is
+bridged to concrete `float32` with `rebind`s under `where S.DT == float32`.
+`test_gpu_scale.mojo` compares the device output to the **float32** CPU trait
+(apples-to-apples) across a dense q-grid incl. near-tail points for all four
+functions: forward `k` within 1e-3, on-device inverse round-trip `q(k(q))` within
+2e-3. 4 new tests, **74 total**, all GPU tests gated on `has_accelerator()`.
 
 ---
 
