@@ -13,3 +13,4 @@ bench = "mojo run -I src bench/bench.mojo"
 
 [dependencies]
 mojo = ">=1.1.0,<2"
+max = ">=26.6.0,<27"

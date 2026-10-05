@@ -262,7 +262,7 @@ tests total.
 
 ---
 
-### Stage 5b — GPU primitives library
+### Stage 5b — GPU primitives library ✅ DONE
 
 The reusable device building blocks, each tested in isolation against a CPU
 reference so later stages compose known-good parts.
@@ -280,6 +280,23 @@ reference so later stages compose known-good parts.
 on random inputs incl. prime / tile-straddling lengths (13, 63/64/65).
 
 **Done when:** every primitive matches its CPU reference within tolerance.
+
+**Outcome.** Added the `max` package (pulls `max.gpu` + `layout`) as the GPU
+dependency and a new `kdigest.gpu` subpackage. All four primitives are
+**single-block** (one thread block, shared memory, up to `BLOCK_CAP = 1024`
+elements) — exactly the granularity the digest pipeline needs (one block per
+digest in 5d, one block per key in 5e); larger arrays tile in the backend.
+Algorithms are correctness-first: **bitonic sort** over a power-of-two padded
+shared array (keys padded with +inf; a value payload rides along), and
+**Hillis-Steele** inclusive/exclusive/segmented scans; compaction is an
+exclusive-scan-of-flags + stable scatter. Each GPU entry point has a matching
+`cpu_*` reference with identical semantics (used by tests and as the no-GPU
+fallback). Host wrappers upload `List`s, launch, and download. `fn` is gone in
+this toolchain — kernels are non-raising `def`s; scalar kernel args must be
+fixed-width (`Int32`, not `Int`). 7 new tests pass against the CPU references
+across lengths {0,1,2,13,31,63,64,65,100,511,512,1000,1024} (fp32 scans within
+1e-5 rtol; sort/compaction exact), for **70 tests total**. All tests are gated on
+`has_accelerator()` so GPU-less CI stays green.
 
 ---
 
