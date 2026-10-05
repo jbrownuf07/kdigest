@@ -197,28 +197,29 @@ backend *behind the same public API*, leaving the Phase 1–3 CPU implementation
 the correctness reference. Mojo targets GPUs directly (see the
 `mojo-gpu-fundamentals` skill), so the port stays in-language.
 
-**Where the GPU wins**
+**Guiding principles**
 
-1. **Batched merge pass (core win).** The merge pass is naturally batch-oriented:
-   - **Parallel sort** of buffer ∪ centroids by mean (GPU radix/merge sort) — the
-     single most expensive step.
-   - **Parallel scale-function evaluation** — `k(q)` (`asin`/`log` for
-     `K1`/`K2`/`K3`) is embarrassingly parallel, one thread per candidate boundary.
-   - **Prefix-sum (scan)** over weights for cumulative quantile positions.
-   - Boundary assignment, though sequentially dependent, reformulates as a
-     **segmented scan** so it parallelizes too.
-2. **Grouped / multi-digest (often the biggest real-world win).** One digest *per
-   key* (per metric / customer / sensor / window) = thousands of independent small
-   digests → one GPU block per digest. This mirrors RAPIDS/libcudf powering Spark's
-   `approx_percentile`.
-3. **Query fan-out.** `quantile()` / `cdf()` over a large array of query points is a
-   parallel map — one thread per query.
-4. **Merge trees for map-reduce.** Combining many partial digests is a parallel
-   reduction tree, exploiting the mergeable property.
+- **CPU stays the oracle.** The GPU path never replaces the CPU `TDigest`; every
+  GPU result is validated against it within an fp tolerance. The sequential
+  single-point `add` remains CPU-only.
+- **Parity before speed.** Each stage ships a GPU-vs-CPU parity test first; the
+  throughput win is the goal but correctness is the gate.
+- **Generic kernels.** The kernels here are built from generic primitives
+  (`thread_idx`, `barrier`, `warp.sum`, shared memory, `TileTensor`) — not vendor
+  intrinsics — so they are not specific to the GPU they were written on and must
+  not be gated to one vendor. (Dev box is Apple silicon; CI should also exercise
+  NVIDIA/AMD lanes.)
+- **Order of attack.** Build single-digest `add_batch` first (it establishes the
+  primitives and the parity harness on the simplest shape), *then* the grouped
+  multi-digest kernel (the biggest real-world payoff).
 
-**Decay interaction (GPU-friendly).** The lazy-decay design survives the port
-cleanly: applying decay is a scalar broadcast-multiply over centroid weights;
-renormalization is a parallel map; pruning (weights below ε) is stream compaction.
+**Float32 path (new decision).** Phase 1–4 are `Float64`. GPUs — especially the
+Apple silicon dev box — are far happier in `Float32`, so the GPU backend targets
+`Float32` first. To avoid forking the math, parameterize the scale functions and
+centroid over a `DType` (defaulting to `float64` on CPU, `float32` on GPU). The
+CPU reference keeps `Float64`; parity tolerances account for the fp32 vs fp64 gap
+(looser than the fp64-vs-fp64 bound, tracked per scale function). If the GPU path
+does not pan out, the `DType` parameter is dropped and we revert to `Float64`.
 
 **Where the GPU does *not* help**
 
@@ -227,30 +228,120 @@ renormalization is a parallel map; pruning (weights below ε) is stream compacti
   scan beats a kernel launch. The crossover is throughput (large batches or many
   concurrent digests).
 
-**Deliverables**
+---
 
-- `add_batch(host_buffer)` — device-side sort + scale-eval + segmented-scan merge.
-- Grouped API — one GPU block per key for many independent digests.
-- Vectorized `quantile`/`cdf` over query arrays.
-- GPU primitives: parallel sort, prefix/segmented scan, stream compaction.
+### Stage 5a — DType generalization (CPU, no GPU yet)
 
-**Steps**
+Prepare the math core for a device port without touching behavior.
 
-1. Implement scale functions as per-thread device functions (reuse Phase 1 math).
-2. Implement the batched merge kernel (sort → k-eval → segmented-scan boundaries).
-3. Add the grouped multi-digest kernel.
-4. Add vectorized query kernels and the parallel merge-tree reduction.
+- Parameterize `Centroid` and the `ScaleFunction` implementations over a
+  `DType` (`comptime dtype: DType = .float64`). Keep `Float64` as the default so
+  all existing tests pass unchanged.
+- Add a `Float32` instantiation and a CPU test that the two agree within an fp32
+  tolerance on the scale round-trip / monotonicity suite.
 
-**Tests**
+**Done when:** `TDigest` still passes all Phase 1–4 tests at `float64`, and a
+`float32` instantiation passes a looser-tolerance parity test on CPU.
 
-- GPU vs. CPU parity: identical centroids/quantiles for the same input (within fp
-  tolerance) across all scale functions.
-- Grouped correctness: per-key GPU digests match per-key CPU digests.
-- Throughput benchmark: ns/point for batched GPU vs. CPU; identify the crossover
-  batch size.
+---
 
-**Done when:** GPU results match the CPU reference within tolerance and batched
-throughput beats CPU above the crossover point.
+### Stage 5b — GPU primitives library
+
+The reusable device building blocks, each tested in isolation against a CPU
+reference so later stages compose known-good parts.
+
+- `gpu/primitives.mojo`:
+  - **Parallel sort** by key (centroid mean) — the dominant merge-pass cost.
+  - **Prefix sum (inclusive/exclusive scan)** over weights.
+  - **Segmented scan** (scan that resets at segment boundaries) — the key to
+    parallel boundary assignment.
+  - **Stream compaction** (drop elements failing a predicate) — for pruning.
+- A `DeviceContext` guard: all GPU tests `comptime if has_accelerator()` and
+  no-op (pass) when no GPU is present, so CI without a GPU stays green.
+
+**Tests (`test_gpu_primitives.mojo`):** each primitive vs. a CPU implementation
+on random inputs incl. prime / tile-straddling lengths (13, 63/64/65).
+
+**Done when:** every primitive matches its CPU reference within tolerance.
+
+---
+
+### Stage 5c — Scale functions as device functions
+
+- Express `k(q)`, `q(k)`, `normalizer(...)` as per-thread device functions
+  reusing the exact Phase 1 formulas (one source of truth, two call sites).
+- Parity test on-device: evaluate `k`/`q` across a grid of `q` values on the GPU
+  and compare against the CPU `ScaleFunction` for all of K0–K3.
+
+**Done when:** on-device scale evaluation matches the CPU trait within fp32
+tolerance for all four functions.
+
+---
+
+### Stage 5d — Single-digest `add_batch` (first GPU backend)
+
+The core single-digest win: amortize one host→device transfer over a large
+buffer, then run the whole compress on-device.
+
+- Public surface: `add_batch(host_buffer)` on the digest, dispatching to a GPU
+  kernel when a device is present and the batch exceeds the crossover (else fall
+  back to the CPU buffer path).
+- Kernel pipeline: **sort** (buffer ∪ existing centroids by mean) → **parallel
+  `k`-evaluation** at candidate boundaries → **segmented-scan boundary
+  assignment** → write compacted centroids back. Decay, if active, is a scalar
+  broadcast-multiply over weights before the pass (reuses the lazy-decay design).
+
+**Tests (`test_gpu_add_batch.mojo`):** GPU `add_batch` vs. CPU `TDigest` on the
+same input — centroid count and quantiles at p0.1/p50/p99.9 within fp32
+tolerance, across all scale functions and across uniform/normal/exponential/
+Pareto; include a decayed-stream parity case.
+
+**Done when:** single-digest GPU results match the CPU reference within tolerance
+for all scale functions, with and without decay.
+
+---
+
+### Stage 5e — Grouped multi-digest (the headline win)
+
+One digest *per key* (per metric / customer / sensor / window) = thousands of
+independent small digests → **one GPU block per digest**. Mirrors RAPIDS/libcudf
+powering Spark's `approx_percentile`. The parallelism is *across* digests, which
+sidesteps the single-digest sequential bottleneck entirely.
+
+- Public surface: `GroupedTDigest` ingesting `(key, value)` batches; per-key
+  `quantile`/`cdf`; a `to_bytes` per key for shipping.
+- Kernel: segment the batch by key, assign one block per key, run the 5d pipeline
+  in block-local shared memory, write per-key centroid arrays back.
+
+**Tests (`test_gpu_grouped.mojo`):** per-key GPU digests match per-key CPU
+digests on a synthetic multi-key stream (keys with differing distributions);
+correctness holds as the number of keys scales.
+
+**Done when:** per-key GPU digests match per-key CPU digests within tolerance,
+and correctness is independent of key count.
+
+---
+
+### Stage 5f — Query fan-out, merge-tree, and crossover benchmark
+
+- **Vectorized `quantile`/`cdf`** over a large query array — one thread per
+  query (parallel map).
+- **Merge-tree reduction** combining many partial digests (parallel reduction,
+  exploits the mergeable property) for map-reduce finalization.
+- **Crossover benchmark** (`bench/bench_gpu.mojo`): ns/point for batched GPU vs.
+  CPU as a function of batch size, and ns/digest for grouped GPU vs. CPU as a
+  function of key count. Identify and document the break-even points; decide
+  whether `add_batch` / `GroupedTDigest` auto-dispatch to CPU below crossover
+  (Open Design Question #5).
+
+**Done when:** query/merge kernels match the CPU reference, and the benchmark
+documents the batch-size and key-count crossovers where GPU beats CPU.
+
+---
+
+**Phase-level done when:** GPU results match the CPU reference within tolerance
+across all scale functions (single and grouped), and batched/grouped throughput
+beats CPU above the measured crossover points.
 
 ---
 
@@ -386,10 +477,13 @@ probability, merges correctly, and is drop-in via the `QuantileSketch` trait.
    Phase 3.
 3. **Asymmetric / single-tail scale functions.** The reference notes these are
    promising for one-sided accuracy; consider as a later extension.
-4. **Generic element type.** Start with `Float64`; consider a `DType` parameter
-   later for `Float32` streams (also eases the GPU port in Phase 5).
+4. **Generic element type.** Start with `Float64`; a `DType` parameter for
+   `Float32` streams is adopted in Phase 5 (Stage 5a) to ease the GPU port. CPU
+   reference stays `Float64`; GPU targets `Float32` first. Drop the parameter and
+   revert to `Float64` if the GPU path is abandoned.
 5. **GPU crossover threshold.** Determine the batch size / digest count at which
-   the Phase 5 GPU path beats CPU, and whether to auto-dispatch based on it.
+   the Phase 5 GPU path beats CPU (measured in Stage 5f), and whether `add_batch`
+   / `GroupedTDigest` auto-dispatch to CPU below crossover.
 6. **Error semantics across backends.** t-digest = empirical tail accuracy;
    DDSketch = guaranteed relative-*value* error; KLL = guaranteed *rank* error.
    The `QuantileSketch` trait unifies the API but not the guarantee — document
