@@ -393,6 +393,28 @@ correctness holds as the number of keys scales.
 **Done when:** per-key GPU digests match per-key CPU digests within tolerance,
 and correctness is independent of key count.
 
+**Outcome (done):** Implemented and green (84/84 suite).
+
+- `src/kdigest/gpu/grouped.mojo` — `_grouped_compress_kernel` launches **one
+  block per key**, each running the exact Stage 5d parallel k-bucketing compress
+  on its key's slice in block-local shared memory. Host wrapper
+  `gpu_grouped_compress[S]` counting-sorts the `(key, value)` batch into per-key
+  contiguous slices, value-sorts each slice, builds a compact one-block-per-key
+  launch for keys that fit (≤ `BLOCK_CAP`), and routes oversized keys to the
+  Stage 5d single-digest `gpu_compress_batch` (hierarchical tiling) — so
+  correctness is independent of *per-key* volume as well as key count.
+- `src/kdigest/grouped.mojo` — `GroupedTDigest[S]` holds one `TDigest[S]` per key
+  and wraps the GPU result via a new `TDigest._from_centroids` factory, so per-key
+  `quantile`/`cdf`/`to_bytes` reuse the full query surface for free. Falls back to
+  a per-key CPU `add` loop when no accelerator is present.
+- Parity, as in 5d, is judged *against true per-key quantiles* (the parallel
+  merge is a valid-but-different clustering than a sequential sweep, so exact
+  centroid-count equality with a CPU digest is not the right bar). Each key's GPU
+  digest and its CPU control both land within a per-rank accuracy band of truth.
+- `test_gpu_grouped.mojo`: 8 keys × 20k, **256 keys × 800** (verifying
+  key-count-independence — compresses in ~59 ms), a mixed-size case (one 100k
+  oversized key via fallback beside small one-block keys), and the CPU fallback.
+
 ---
 
 ### Stage 5f — Query fan-out, merge-tree, and crossover benchmark

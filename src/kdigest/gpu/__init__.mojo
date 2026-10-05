@@ -21,3 +21,4 @@ from kdigest.gpu.primitives import (
 )
 from kdigest.gpu.scale_device import gpu_scale_eval
 from kdigest.gpu.add_batch import gpu_compress_batch
+from kdigest.gpu.grouped import gpu_grouped_compress, GroupedResult

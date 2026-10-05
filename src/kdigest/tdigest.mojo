@@ -637,3 +637,31 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
         result._min = min_v
         result._max = max_v
         return result^
+
+    @staticmethod
+    def _from_centroids(
+        compression: Float64,
+        means: List[Float64],
+        weights: List[Float64],
+        min_v: Float64,
+        max_v: Float64,
+        scale: Self.S = Self.S(),
+    ) -> Self:
+        """Build a (decay-free) digest directly from merged centroid arrays.
+
+        Used by `GroupedTDigest` to wrap per-key centroids produced on the GPU
+        so they inherit the full query surface (quantile/cdf/to_bytes). The
+        centroids must already be mean-sorted and compressed.
+        """
+        var result = Self(compression=compression, scale=scale)
+        var total = 0.0
+        for i in range(len(means)):
+            result._centroids.append(
+                _Centroid(mean=means[i], weight=weights[i])
+            )
+            total += weights[i]
+        result._stored_total = total
+        result._clock = total
+        result._min = min_v
+        result._max = max_v
+        return result^

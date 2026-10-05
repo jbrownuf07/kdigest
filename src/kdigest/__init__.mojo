@@ -21,3 +21,4 @@ from kdigest.scale import (
     ScaleK3Impl,
 )
 from kdigest.tdigest import TDigest
+from kdigest.grouped import GroupedTDigest
