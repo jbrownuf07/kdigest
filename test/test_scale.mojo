@@ -9,7 +9,7 @@ Validates the three invariants from PLAN.md Phase 1:
 
 from std.testing import assert_almost_equal, assert_true, TestSuite
 
-from stream_fire.scale import ScaleFunction, ScaleK0, ScaleK1, ScaleK2, ScaleK3
+from kdigest.scale import ScaleFunction, ScaleK0, ScaleK1, ScaleK2, ScaleK3
 
 
 comptime COMPRESSION = 200.0

@@ -1,4 +1,4 @@
-# stream-fire — Implementation Plan
+# kdigest — Implementation Plan
 
 Goal: a Mojo t-digest library specialized for accurate **extreme-tail**
 quantiles over streaming data, with (1) **exponential decay** of centroid
@@ -15,7 +15,7 @@ layer on decay and performance.
 
 **Deliverables**
 
-- `src/stream_fire/` package with an empty `__init__.mojo`.
+- `src/kdigest/` package with an empty `__init__.mojo`.
 - `test/` directory.
 - `pixi.toml` tasks: `test`, `fmt`, `build`.
 - Confirm `pixi install` resolves and a trivial `mojo` file compiles.

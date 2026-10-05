@@ -1,4 +1,4 @@
-"""Stream-fire: accurate streaming quantiles at the extremes, with time decay.
+"""Accurate streaming quantiles at the extremes, with time decay (kdigest).
 
 A Mojo implementation of the t-digest data structure, specialized for accurate
 extreme-tail quantile estimation over unbounded data streams. Adds exponential
@@ -7,8 +7,8 @@ decay of centroid weights (recency weighting) and pluggable scale functions.
 See README.md for an overview and PLAN.md for the implementation roadmap.
 """
 
-from stream_fire.centroid import Centroid
-from stream_fire.scale import (
+from kdigest.centroid import Centroid
+from kdigest.scale import (
     ScaleFunction,
     ScaleK0,
     ScaleK1,

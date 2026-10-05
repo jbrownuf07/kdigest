@@ -8,7 +8,7 @@ from std.testing import assert_true, TestSuite
 
 
 def test_package_imports() raises:
-    # If this file compiles, the stream_fire package resolved on the import
+    # If this file compiles, the kdigest package resolved on the import
     # path (configured via `-I src` in the pixi `test` task).
     assert_true(True)
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run every Mojo test file under test/ against the TestSuite runner.
 # Mojo removed the `mojo test` subcommand, so each file has a `main()` that
-# calls TestSuite.discover_tests(...). We add `-I src` so the stream_fire
+# calls TestSuite.discover_tests(...). We add `-I src` so the kdigest
 # package resolves on the import path.
 set -euo pipefail
 

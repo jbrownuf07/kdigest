@@ -2,7 +2,7 @@
 
 from std.testing import assert_almost_equal, assert_equal, TestSuite
 
-from stream_fire.centroid import Centroid
+from kdigest.centroid import Centroid
 
 
 def test_singleton() raises:

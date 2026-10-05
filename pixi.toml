@@ -1,14 +1,14 @@
 [workspace]
 authors = ["Joe Brown <jbrown@grailbio.com>"]
 channels = ["https://conda.modular.com/max", "conda-forge"]
-name = "stream-fire"
+name = "kdigest"
 platforms = ["osx-arm64"]
 version = "0.1.0"
 
 [tasks]
 test = "bash scripts/run_tests.sh"
 fmt = "mojo format src/ test/"
-build = "mojo precompile src/stream_fire -o /tmp/stream_fire.mojoc"
+build = "mojo precompile src/kdigest -o /tmp/kdigest.mojoc"
 
 [dependencies]
 mojo = ">=1.1.0,<2"

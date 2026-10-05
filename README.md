@@ -1,14 +1,14 @@
-# stream-fire
+# kdigest
 
 **Accurate streaming quantiles at the extremes — with time decay.**
 
-`stream-fire` is a [Mojo](https://docs.modular.com/mojo/) library for estimating
+`kdigest` is a [Mojo](https://docs.modular.com/mojo/) library for estimating
 quantiles over unbounded data streams using the
 [**t-digest**](https://github.com/tdunning/t-digest) data structure. It is
 optimized for the hard part of the distribution: the **extreme tails** (near
 \(q = 0\) and \(q = 1\)), where naive sketches lose accuracy fastest.
 
-On top of the standard t-digest, `stream-fire` adds two capabilities that make
+On top of the standard t-digest, `kdigest` adds two capabilities that make
 it well suited to real-time, non-stationary streams:
 
 1. **Exponential decay of centroid weights** — recent observations count more
@@ -103,7 +103,7 @@ below a floor, keeping memory bounded.
 ## Target API
 
 ```mojo
-from stream_fire import TDigest, ScaleK2, Decay
+from kdigest import TDigest, ScaleK2, Decay
 
 def main() raises:
     # Compression (delta): higher = more centroids = more accuracy.
@@ -148,21 +148,24 @@ def main() raises:
 ## Project layout (planned)
 
 ```
-stream-fire/
+kdigest/
 ├── README.md              # this file
 ├── PLAN.md                # phased implementation plan
 ├── pixi.toml              # Mojo toolchain (Modular MAX channel)
+├── scripts/
+│   └── run_tests.sh           # test runner (mojo run over test/test_*.mojo)
 ├── src/
-│   └── stream_fire/
-│       ├── centroid.mojo      # Centroid value type
-│       ├── scale.mojo         # ScaleFunction trait + K0/K1/K2/K3
-│       ├── decay.mojo         # Decay policy (rate / half-life)
-│       ├── tdigest.mojo       # MergingDigest core (add/merge/quantile/cdf)
+│   └── kdigest/
+│       ├── centroid.mojo      # Centroid value type                    [done]
+│       ├── scale.mojo         # ScaleFunction trait + K0/K1/K2/K3       [done]
+│       ├── decay.mojo         # Decay policy (rate / half-life)         [planned]
+│       ├── tdigest.mojo       # MergingDigest core (add/merge/quantile) [planned]
 │       └── __init__.mojo      # public exports
 └── test/
+    ├── test_centroid.mojo     # weighted-mean correctness
     ├── test_scale.mojo        # scale function identities & inverses
-    ├── test_tdigest.mojo      # accuracy vs. exact quantiles
-    └── test_decay.mojo        # decay behavior on drifting streams
+    ├── test_tdigest.mojo      # accuracy vs. exact quantiles            [planned]
+    └── test_decay.mojo        # decay behavior on drifting streams      [planned]
 ```
 
 ---
