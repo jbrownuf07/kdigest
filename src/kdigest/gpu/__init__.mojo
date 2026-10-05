@@ -29,6 +29,7 @@ from kdigest.gpu.add_batch import (
 from kdigest.gpu.sort import gpu_sort_by_mean
 from kdigest.gpu.grouped import (
     gpu_grouped_compress,
+    gpu_grouped_compress_weighted,
     GroupedResult,
     GroupedWorkspace,
 )

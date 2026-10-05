@@ -11,15 +11,24 @@ different distributions, and we confirm the result is independent of key count.
 A mixed-size test exercises both routes at once — small keys (one-block path)
 beside one oversized key (> BLOCK_CAP → hierarchical fallback).
 
+Accumulation tests (regression for a bug where each GPU `add_batch` rebuilt
+every key from the latest batch alone) feed several batches — keys coming and
+going, decay on and off, a key crossing BLOCK_CAP mid-stream — and require each
+key to equal, exactly, a reference `TDigest` fed the same per-key batches.
+
 Gated on `has_accelerator()`: no GPU → no-op pass.
 """
 
 from std.sys import has_accelerator
 from std.testing import assert_true, TestSuite
 
-from kdigest import TDigest, ScaleK2, GroupedTDigest
+from kdigest import TDigest, ScaleK2, GroupedTDigest, Decay, GpuSession
 from kdigest.gpu.add_batch import gpu_compress_batch_host_tiled
-from kdigest.gpu.grouped import gpu_grouped_compress, GroupedWorkspace
+from kdigest.gpu.grouped import (
+    gpu_grouped_compress,
+    gpu_grouped_compress_weighted,
+    GroupedWorkspace,
+)
 from max.gpu.host import DeviceContext
 
 
@@ -227,6 +236,197 @@ def test_grouped_matches_per_key_reference_exactly() raises:
             for j in range(len(r[0])):
                 assert_true(r[0][j] == res.means[k][j], "mean " + tag)
                 assert_true(r[1][j] == res.weights[k][j], "weight " + tag)
+
+
+def _check_accumulation(decay: Decay) raises:
+    """Several batches into one GroupedTDigest, with keys appearing in some
+    batches but not others and one key growing past BLOCK_CAP (prior centroids
+    + new samples) so it moves to the oversized path mid-stream. Per key, the
+    result must equal a reference TDigest fed the same per-key batches through
+    the same GPU batch path, exactly."""
+    comptime num_keys = 6
+    var g = GroupedTDigest[ScaleK2](num_keys, COMPRESSION, decay)
+    var refs = List[TDigest[ScaleK2]]()
+    for _ in range(num_keys):
+        refs.append(TDigest[ScaleK2](compression=COMPRESSION, decay=decay))
+    var session = GpuSession()
+    var rng = _Rng(0xACC0)
+    for batch in range(5):
+        var keys = List[Int32]()
+        var values = List[Float64]()
+        var per_key = List[List[Float64]](length=num_keys, fill=List[Float64]())
+        for i in range(400):
+            for k in range(num_keys):
+                if k == 1 and batch % 2 == 1:
+                    continue  # key 1 skips odd batches
+                if k == 2 and batch >= 2:
+                    continue  # key 2 stops after batch 1
+                if k == 4 and i >= 10:
+                    continue  # key 4 stays tiny
+                if k == 5 and batch == 3 and i >= 300:
+                    continue  # key 5: irregular batch sizes
+                # key 3 gets 1,200 samples in batch 4 -> oversized path
+                var v = rng.unit() * Float64(k + 1) + Float64(batch)
+                keys.append(Int32(k))
+                values.append(v)
+                per_key[k].append(v)
+        if batch == 4:
+            for _ in range(800):
+                var v = rng.unit() * 4.0 + 4.0
+                keys.append(Int32(3))
+                values.append(v)
+                per_key[3].append(v)
+        g.add_batch(keys, values)
+        for k in range(num_keys):
+            if len(per_key[k]) > 0:
+                refs[k]._add_batch_gpu(per_key[k], session)
+
+    var qs = [0.0, 0.01, 0.25, 0.5, 0.75, 0.99, 1.0]
+    for k in range(num_keys):
+        var tag = String("key=", k, " decay=", decay.rate_lambda)
+        assert_true(
+            g.centroid_count(k) == len(refs[k]), "centroid count " + tag
+        )
+        assert_true(
+            g.total_weight(k) == refs[k].total_weight(), "total weight " + tag
+        )
+        for i in range(len(qs)):
+            assert_true(
+                g.quantile(k, qs[i]) == refs[k].quantile(qs[i]),
+                "quantile " + tag,
+            )
+
+
+def test_grouped_accumulates_across_batches() raises:
+    # Regression: the GPU path used to rebuild every key from the latest batch
+    # only, dropping earlier batches and wiping keys absent from the batch.
+    comptime if not has_accelerator():
+        return
+    _check_accumulation(Decay.none())
+
+
+def test_grouped_accumulates_with_decay() raises:
+    comptime if not has_accelerator():
+        return
+    _check_accumulation(Decay.half_life(500.0))
+
+
+def test_grouped_untouched_key_and_total_weight() raises:
+    comptime if not has_accelerator():
+        return
+    var g = GroupedTDigest[ScaleK2](3, COMPRESSION)
+    var k1 = List[Int32]()
+    var v1 = List[Float64]()
+    for i in range(500):
+        for k in range(3):
+            k1.append(Int32(k))
+            v1.append(Float64(i))
+    g.add_batch(k1, v1)
+    var before_count = g.centroid_count(2)
+    var before_p50 = g.quantile(2, 0.5)
+    var k2 = List[Int32]()
+    var v2 = List[Float64]()
+    for i in range(300):
+        k2.append(Int32(0))
+        v2.append(Float64(1000 + i))
+    g.add_batch(k2, v2)
+    assert_true(g.total_weight(0) == 800.0, "key 0 accumulated weight")
+    assert_true(g.total_weight(2) == 500.0, "untouched key weight")
+    assert_true(g.centroid_count(2) == before_count, "untouched key centroids")
+    assert_true(g.quantile(2, 0.5) == before_p50, "untouched key quantile")
+    # Key 0 now spans both batches: its median sits at the batch boundary.
+    var p50 = g.quantile(0, 0.5)
+    assert_true(p50 > 300.0 and p50 < 1100.0, "key 0 median spans batches")
+
+
+def test_grouped_invalid_batch_leaves_state_unchanged() raises:
+    var g = GroupedTDigest[ScaleK2](2, COMPRESSION)
+    var k1 = List[Int32]()
+    var v1 = List[Float64]()
+    for i in range(200):
+        k1.append(Int32(i % 2))
+        v1.append(Float64(i))
+    g.add_batch(k1, v1)
+    var w0 = g.total_weight(0)
+    var w1 = g.total_weight(1)
+    var bad_k = List[Int32]()
+    var bad_v = List[Float64]()
+    for i in range(100):
+        bad_k.append(Int32(i % 2))
+        bad_v.append(Float64(i))
+    bad_v[57] = Float64.MAX_FINITE * 10.0  # inf, near the end of the batch
+    var raised = False
+    try:
+        g.add_batch(bad_k, bad_v)
+    except:
+        raised = True
+    assert_true(raised, "non-finite value must raise")
+    assert_true(g.total_weight(0) == w0, "key 0 unchanged after bad batch")
+    assert_true(g.total_weight(1) == w1, "key 1 unchanged after bad batch")
+
+
+def test_grouped_weighted_matches_single_digest_exactly() raises:
+    """`gpu_grouped_compress_weighted` with prior centroids + scaled new
+    weights must equal, per key, `gpu_compress_batch` on (prior ++ new) —
+    including heavy ties between prior means and new values, and a key pushed
+    past BLOCK_CAP by its prior centroids."""
+    comptime if not has_accelerator():
+        return
+    var ctx = DeviceContext()
+    var ws = GroupedWorkspace(ctx)
+    comptime num_keys = 5
+    var rng = _Rng(0xBEEF)
+    var prior_m = List[List[Float32]](length=num_keys, fill=List[Float32]())
+    var prior_w = List[List[Float32]](length=num_keys, fill=List[Float32]())
+    var new_w = List[Float32]()
+    var prior_sizes = [0, 40, 200, 900, 7]
+    for k in range(num_keys):
+        new_w.append(Float32(1.0 + 0.25 * Float64(k)))
+        for j in range(prior_sizes[k]):
+            # Coarse grid -> many exact ties with the new values below.
+            prior_m[k].append(Float32(Int(rng.unit() * 20.0)))
+            prior_w[k].append(Float32(1.0 + Float64(j % 5)))
+    var keys = List[Int32]()
+    var values = List[Float64]()
+    var per_key = List[List[Float64]](length=num_keys, fill=List[Float64]())
+    for i in range(300):
+        for k in range(num_keys):
+            if k == 4 and i >= 3:
+                continue
+            var v = Float64(Int(rng.unit() * 20.0))
+            keys.append(Int32(k))
+            values.append(v)
+            per_key[k].append(v)
+    var res = gpu_grouped_compress_weighted[ScaleK2.F32](
+        ctx,
+        ws,
+        keys,
+        values,
+        new_w,
+        prior_m,
+        prior_w,
+        num_keys,
+        Float32(COMPRESSION),
+    )
+    for k in range(num_keys):
+        var m = prior_m[k].copy()
+        var w = prior_w[k].copy()
+        for j in range(len(per_key[k])):
+            m.append(Float32(per_key[k][j]))
+            w.append(new_w[k])
+        var ref_out = gpu_compress_batch_host_tiled[ScaleK2.F32](
+            ctx, m, w, Float32(COMPRESSION)
+        )
+        assert_true(
+            len(res.means[k]) == len(ref_out[0]),
+            String("weighted grouped count, key ", k),
+        )
+        for j in range(len(ref_out[0])):
+            assert_true(
+                res.means[k][j] == ref_out[0][j]
+                and res.weights[k][j] == ref_out[1][j],
+                String("weighted grouped centroid, key ", k),
+            )
 
 
 def test_grouped_cpu_fallback_runs() raises:

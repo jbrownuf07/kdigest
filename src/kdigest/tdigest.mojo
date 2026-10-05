@@ -223,7 +223,32 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
     def _add_batch_gpu(
         mut self, values: List[Float64], mut session: GpuSession
     ) raises where Self.S.F32.DT == DType.float32:
+        var batch = self._gpu_batch_prepare(values)
+        var out = gpu_compress_batch[Self.S.F32](
+            session.ctx,
+            session.ws.batch,
+            batch[0],
+            batch[1],
+            Float32(self.compression),
+        )
+        self._gpu_batch_finish(out[0], out[1])
+
+    def _gpu_batch_prepare(
+        mut self, values: List[Float64]
+    ) raises -> Tuple[List[Float32], List[Float32]]:
+        """First half of a GPU batch update (shared with `GroupedTDigest`).
+
+        Validates `values`, advances the clock by `len(values)` ticks, and
+        returns the Float32 (mean, weight) set to compress: the existing
+        centroids and buffer (already scaled) plus the new unit-weight samples
+        scaled by the current decay factor. Updates min/max and the stored
+        total. Must be followed by `_gpu_batch_finish` with the compressed
+        result."""
         var n = len(values)
+        var means = List[Float32]()
+        var weights = List[Float32]()
+        if n == 0:
+            return (means^, weights^)
         # Validate up front (the GPU kernel assumes finite inputs).
         for i in range(n):
             self._validate(values[i], 1.0)
@@ -235,8 +260,8 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
 
         # Assemble (mean, weight) in Float32: existing centroids (already
         # scaled) + the new samples (scaled on the way in).
-        var means = List[Float32]()
-        var weights = List[Float32]()
+        means.reserve(len(self._centroids) + len(self._buffer) + n)
+        weights.reserve(len(self._centroids) + len(self._buffer) + n)
         for i in range(len(self._centroids)):
             means.append(Float32(self._centroids[i].mean))
             weights.append(Float32(self._centroids[i].weight))
@@ -268,19 +293,19 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
                 self._min = vmin
             if vmax > self._max:
                 self._max = vmax
+        return (means^, weights^)
 
-        var out = gpu_compress_batch[Self.S.F32](
-            session.ctx,
-            session.ws.batch,
-            means,
-            weights,
-            Float32(self.compression),
-        )
-        var new_centroids = List[_Centroid]()
+    def _gpu_batch_finish(
+        mut self, means: List[Float32], weights: List[Float32]
+    ):
+        """Second half of a GPU batch update: install the compressed centroids
+        (`means`/`weights`, mean-sorted), reconcile the stored total, and prune
+        decayed mass."""
+        var new_centroids = List[_Centroid](capacity=len(means))
         var total = 0.0
-        for i in range(len(out[0])):
-            var wt = Float64(out[1][i])
-            new_centroids.append(_Centroid(mean=Float64(out[0][i]), weight=wt))
+        for i in range(len(means)):
+            var wt = Float64(weights[i])
+            new_centroids.append(_Centroid(mean=Float64(means[i]), weight=wt))
             total += wt
         self._centroids = new_centroids^
         # Reconcile the stored total with the compressed weights (fp32 rounding

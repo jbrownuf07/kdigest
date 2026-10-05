@@ -490,8 +490,29 @@ documents the batch-size and key-count crossovers where GPU beats CPU.
     `_GPU_CROSSOVER` is set to 60k and `_GPU_CROSSOVER_SESSION` to 40k. Still
     open:
     - Batch oversized keys into one segmented launch (the fallback is ~0.19×).
+      **Now more pressing:** since the accumulation fix below, a key's existing
+      centroids are folded into each batch, so a key receiving ≳950 samples per
+      batch overflows BLOCK_CAP on every batch after the first. Measured: 4,096
+      keys × 1,000/batch, 2nd batch = 864k ns/digest GPU vs 89k CPU (~0.1×).
     - Cut the per-key host bookkeeping that keeps tiny-key grouped batches on
       the CPU.
+  - *Fix — grouped accumulation (post-5f):* `GroupedTDigest.add_batch` on the
+    GPU used to rebuild every key's digest from the latest batch alone, so
+    earlier batches were lost and keys absent from a batch were reset to empty
+    (the CPU fallback accumulated correctly). Now each touched key prepares its
+    input exactly as `TDigest.add_batch` does (`_gpu_batch_prepare`: existing
+    centroids + buffer + new samples scaled by its decay factor, clock advanced
+    by its sample count), the grouped kernel compresses weighted
+    (mean, weight) pairs (`gpu_grouped_compress_weighted`; stable on ties, with
+    the same segment clamp as the single-digest kernel), and the result is
+    installed back (`_gpu_batch_finish`). Untouched keys are left unchanged.
+    `GroupedTDigest` also gained an optional `decay` (per-key clocks). The
+    whole batch is validated before any digest changes. Unit-weight batches
+    with no prior state use a values-only kernel variant, so the raw
+    `gpu_grouped_compress` speed is unchanged (A/B: 18.8k vs 18.9k ns/digest).
+    Tests: per key, the result equals a reference `TDigest` fed the same
+    batches *exactly*, with and without decay, keys coming and going, and a key
+    crossing BLOCK_CAP mid-stream.
 
 ---
 
