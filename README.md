@@ -206,7 +206,9 @@ not a committed SLA):
 
 K2/K3 drive tail error into the single-digit-ppm range (trading some median
 accuracy); K0 (linear) has the weakest tails. This is the t-digest trade-off the
-scale function selects.
+scale function selects. See [`bench/Benchmark.md`](./bench/Benchmark.md) for the
+full methodology, per-benchmark characteristics, and a seasonal
+(decay-tracking) scenario.
 
 See [`PLAN.md`](./PLAN.md) for the step-by-step build-out.
 
