@@ -26,6 +26,12 @@ from std.testing import assert_true, TestSuite
 
 from kdigest import TDigest, ScaleK0, ScaleK1, ScaleK2, ScaleK3, Decay
 from kdigest.scale import ScaleFunction
+from kdigest.gpu.add_batch import (
+    gpu_compress_batch,
+    gpu_compress_batch_host_sort,
+    gpu_compress_batch_host_tiled,
+)
+from max.gpu.host import DeviceContext
 
 
 comptime N = 200_000
@@ -281,6 +287,49 @@ def test_add_batch_decayed() raises:
                 gq,
             ),
         )
+
+
+def _check_paths_identical(
+    ctx: DeviceContext, n: Int, levels: Int, seed: UInt64
+) raises:
+    """All three compress paths must return bit-identical centroids. `levels`
+    > 0 quantizes the means into that many distinct values (heavy ties), which
+    exercises sort stability and the merge-pass tie-breaking."""
+    var state = seed
+    var m = List[Float32]()
+    var w = List[Float32]()
+    for _ in range(n):
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u = Float64(state >> 11) / Float64(1 << 53)
+        state = state * 6364136223846793005 + 1442695040888963407
+        var u2 = Float64(state >> 11) / Float64(1 << 53)
+        var v = Float64(Int(u * Float64(levels))) if levels > 0 else u
+        m.append(Float32(v))
+        w.append(Float32(1.0 + u2))
+    var r0 = gpu_compress_batch_host_tiled[ScaleK2.F32](ctx, m, w, 100.0)
+    var r1 = gpu_compress_batch_host_sort[ScaleK2.F32](ctx, m, w, 100.0)
+    var r2 = gpu_compress_batch[ScaleK2.F32](ctx, m, w, 100.0)
+    var tag = String("n=", n, " levels=", levels)
+    assert_true(len(r0[0]) == len(r1[0]), "count ref vs A " + tag)
+    assert_true(len(r0[0]) == len(r2[0]), "count ref vs B " + tag)
+    for i in range(len(r0[0])):
+        assert_true(r0[0][i] == r1[0][i], "mean ref vs A " + tag)
+        assert_true(r0[1][i] == r1[1][i], "weight ref vs A " + tag)
+        assert_true(r0[0][i] == r2[0][i], "mean ref vs B " + tag)
+        assert_true(r0[1][i] == r2[1][i], "weight ref vs B " + tag)
+
+
+def test_device_pipeline_matches_reference() raises:
+    # Step 3: the GPU-sort + device-resident pipeline (default) and the
+    # host-sort + device-tiling variant must reproduce the per-tile host
+    # reference *exactly* — same sort order, same tiles, same kernel.
+    comptime if not has_accelerator():
+        return
+    var ctx = DeviceContext()
+    var sizes = [1, 2, 1023, 1024, 1025, 2049, 5_000, 70_001, 300_000]
+    for i in range(len(sizes)):
+        _check_paths_identical(ctx, sizes[i], 0, UInt64(0x51 + i))
+        _check_paths_identical(ctx, sizes[i], 37, UInt64(0x77 + i))
 
 
 def test_add_batch_below_crossover_matches_add() raises:

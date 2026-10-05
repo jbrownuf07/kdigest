@@ -172,22 +172,44 @@ one-time kernel module load stays out of the timed rows.
 ### 4a. Batched single-digest — `gpu_compress_batch` vs CPU `add` loop
 
 Folding one batch into one digest, swept over batch size. "ns/pt" is wall-clock
-nanoseconds per input point (lower is better); "err" is the rank error vs. the
-exact quantile (lower is better). "before" is the original 5f implementation
-(see 4c).
+nanoseconds per input point (lower is better), best of 3 runs. Four
+implementations are timed on identical input:
 
-| N | GPU ns/pt (before) | GPU ns/pt | CPU ns/pt | speedup | GPU p50 err | CPU p50 err | GPU p99 err | CPU p99 err |
-| --------- | ------- | ------ | --- | ----- | ------ | ------ | ------ | ------ |
-| 1,000 | ~12,100 | ~3,400 | ~94 | 0.027× | 0.0 | 1.0e-3 | 1.0e-3 | 1.0e-3 |
-| 10,000 | ~5,400 | ~3,800 | ~91 | 0.024× | 1.1e-3 | 2.4e-3 | 1.0e-4 | 3.0e-4 |
-| 50,000 | ~10,700 | ~3,600 | ~90 | 0.025× | 7.8e-4 | 2.0e-5 | 2.0e-5 | 2.2e-4 |
-| 100,000 | ~17,500 | ~3,900 | ~88 | 0.023× | 6.5e-4 | 2.1e-4 | 2.0e-5 | 1.1e-4 |
-| 500,000 | ~73,900 | ~3,900 | ~91 | 0.023× | 2.8e-4 | 2.1e-3 | 2.2e-5 | 7.6e-5 |
-| 1,000,000 | ~144,700 | ~3,950 | ~89 | 0.023× | 7.4e-5 | 1.8e-3 | 5.2e-5 | 3.0e-4 |
+- **5f** — the original Stage 5f code (O(n²) host sort, five buffers per tile).
+- **ref** — after the sort/buffer fixes (4c): host merge sort, then one
+  upload → single-block launch → readback *per tile*.
+- **A** — step 3 part A: host sort, then **device-resident tiling** (one upload,
+  one multi-block launch per pass, one readback).
+- **B** — step 3 part B, the default `gpu_compress_batch`: **GPU sort** +
+  device-resident tiling. The batch never leaves the GPU until the final
+  centroids.
 
-The GPU cost is now **flat in N** (~3.5–4 µs/pt) instead of growing with it — a
-**~37× improvement at 1M points** — but it is still **~40× slower than the CPU**.
-Accuracy is unchanged (same kernel, same clustering).
+| N | 5f | ref | A | **B (default)** | CPU | B vs CPU |
+| --------- | ------- | ------ | ---- | ----- | --- | ----- |
+| 1,000 | ~12,100 | ~3,160 | ~3,040 | ~3,420 | ~85 | 0.02× |
+| 10,000 | ~5,400 | ~3,710 | ~600 | ~530 | ~89 | 0.17× |
+| 50,000 | ~10,700 | ~3,590 | ~236 | ~159 | ~87 | 0.55× |
+| 100,000 | ~17,500 | ~3,720 | ~175 | ~100 | ~89 | 0.89× |
+| 200,000 | — | ~3,160 | ~148 | **~73** | ~88 | **1.21×** |
+| 300,000 | — | ~3,650 | ~142 | **~74** | ~88 | **1.20×** |
+| 500,000 | ~73,900 | ~3,290 | ~138 | **~69** | ~89 | **1.29×** |
+| 1,000,000 | ~144,700 | ~3,670 | ~139 | **~60** | ~90 | **1.49×** |
+| 2,000,000 | — | ~3,620 | ~141 | **~63** | ~88 | **1.40×** |
+| 4,000,000 | — | ~3,380 | ~148 | **~71** | ~89 | **1.25×** |
+
+All three GPU paths return **bit-identical centroids** (enforced by
+`test_device_pipeline_matches_reference`, including heavy-tie inputs), so the
+accuracy is the same for all of them:
+
+| N | GPU p50 err | CPU p50 err | GPU p99 err | CPU p99 err |
+| --------- | ------ | ------ | ------ | ------ |
+| 10,000 | 1.1e-3 | 2.4e-3 | 1.0e-4 | 3.0e-4 |
+| 100,000 | 6.5e-4 | 2.1e-4 | 2.0e-5 | 1.1e-4 |
+| 1,000,000 | 7.4e-5 | 1.8e-3 | 5.2e-5 | 3.0e-4 |
+| 4,000,000 | 9.8e-5 | 1.3e-4 | 2.0e-5 | 9.9e-5 |
+
+**The GPU now beats the CPU on single-digest batches from ~150k points,
+peaking at ~1.5× around 1M points.**
 
 ### 4b. Grouped multi-digest — `gpu_grouped_compress` vs CPU per-key loop
 
@@ -205,8 +227,8 @@ oversized-key fallback through `gpu_compress_batch`, one key at a time.
 | 16,384 × 500 | one block per key | ~43k | ~39k | 0.91× |
 | 16,384 × 100 | one block per key | ~16.6k | ~5.5k | 0.33× |
 | 65,536 × 100 | one block per key | ~15.9k | ~5.6k | 0.35× |
-| 64 × 2,000 | oversized fallback | ~9.5M | ~170k | 0.018× |
-| 256 × 2,000 | oversized fallback | ~10.5M | ~174k | 0.017× |
+| 64 × 2,000 | oversized fallback | ~5.0M | ~171k | 0.034× |
+| 256 × 2,000 | oversized fallback | ~5.2M | ~171k | 0.033× |
 
 **Correction to the earlier version of this table.** The original 5f grouped rows
 all used 2,000 samples per key — above `BLOCK_CAP` — so *every* key went through
@@ -243,6 +265,63 @@ The real costs, and the fixes:
    ("Failed to create Metal command queue") in tight loops — the benchmark now
    runs its full sweep, including 65,536 keys, without crashing.
 
+### 4d. Step 3 — sort and tiling on the GPU
+
+After 4c the batched path was flat at ~3.8 µs/pt. Splitting that cost showed
+two separate problems, which is why step 3 has two parts:
+
+| N | total | host sort | per-tile round trips | tiles | per round trip |
+| ------- | ------ | ------ | ------ | ---- | ------ |
+| 100,000 | 3,804 ns/pt | 101 ns/pt | 3,704 ns/pt | 98 | ~3.8 ms |
+| 1,000,000 | 3,859 ns/pt | 120 ns/pt | 3,739 ns/pt | 977 | ~3.8 ms |
+
+- **Round trips were ~97% of the cost.** Every `map_to_host` waits for the GPU,
+  and each tile did several of them.
+- **The host sort alone (100–120 ns/pt) already exceeded the CPU digest's whole
+  ~90 ns/pt.** The CPU digest only sorts small buffers; the GPU path sorts the
+  entire batch. So the sort *had* to move to the GPU to win.
+
+**Part A — device-resident tiling** (`gpu_compress_batch_host_sort`). The
+compress kernel was generalized so block `b` compresses tile `b`; each pass is
+now **one multi-block launch** over all tiles. A small `_gather_tiles_kernel`
+packs each tile's survivors densely on the device for the next pass. The host
+only reads the per-tile survivor counts each pass (a few hundred integers) and
+uploads their prefix sums. Result: **~3,670 → ~139 ns/pt at 1M** — now bounded
+by the host sort, exactly as predicted.
+
+**Part B — GPU sort** (`kdigest.gpu.sort`, used by the default
+`gpu_compress_batch`). A stable sort entirely on the device:
+
+1. `_tile_sort_kernel` — one block per 1,024-element tile, bitonic sort in
+   shared memory of (mean, original index) pairs. Comparing on (mean, index)
+   makes every element distinct, so the result is exactly a *stable* sort.
+2. `_merge_pass_kernel` — merges adjacent sorted runs, one thread per element:
+   its output position is its rank in its own run plus a binary-search count of
+   preceding elements in the partner run. ~10 passes for 1M points, enqueued
+   back to back with **no host synchronization** between them.
+3. `_permute_kernel` — gathers the weights through the final permutation.
+
+Result: **~139 → ~60 ns/pt at 1M**, and the GPU passes the CPU.
+
+**Two correctness details that fell out of this.**
+
+- **Sort once, not per pass.** After a compress pass, each tile's centroids are
+  in mean order and tiles are in global order, so the survivors are already
+  sorted for the next pass. The old path re-sorted between passes.
+- **Clamping centroid means.** That "already sorted" argument relies on every
+  centroid's mean lying within its segment's [first, last] value. In Float32 the
+  weighted mean Σw·x/Σw can round a hair outside that range, and with heavily
+  tied inputs this produced adjacent centroids out of order by one ulp. The
+  kernel now clamps each mean to its segment's range. This makes the ordering
+  guarantee exact, and the three paths bit-identical, ties included.
+
+**What's left.** Below ~150k points the GPU still loses because of fixed
+per-call cost. A call allocates six device buffers, and each compress pass does
+one count readback and one offsets upload that both wait for the GPU. That is
+~3 ms in total, which is why N = 1,000 still costs ~3,400 ns/pt. Possible next
+steps are computing the tile offsets on the device (removing the per-pass sync),
+reusing device buffers across calls, and a faster bitonic merge for the sort.
+
 **Reading the results.**
 
 - **Accuracy is the GPU's clear win.** The parallel compress is at least as
@@ -253,27 +332,26 @@ The real costs, and the fixes:
   key the GPU runs at **0.84–1.03×** the CPU and edges ahead at 4,096 × 1,000.
   With few samples per key (100) the CPU wins ~3×, because per-key host work
   (scatter, per-slice sort, building the launch) dominates the tiny GPU job.
-- **Batched single-digest is still ~40× slower.** What remains is the
-  *structure* of the host loop: each 1,024-element tile is a separate
-  upload → launch → readback, and every `map_to_host` waits for the GPU. At 1M
-  points that is ~1,000 round trips per pass, and the input sort still runs on
-  the host. The CPU `add` loop is a tight in-cache append + periodic merge at
-  ~90 ns/pt.
-- **The oversized-key fallback is the slow path.** It compresses large keys one
-  at a time through `gpu_compress_batch`, so it inherits the per-tile round trips
-  above; avoid it by keeping keys ≤ `BLOCK_CAP` samples per batch.
+- **Batched single-digest now wins above ~150k points** (1.2–1.5×). Below that
+  the fixed per-call cost (~3 ms: buffer allocation plus a couple of GPU waits
+  per pass) dominates.
+- **The oversized-key fallback is still the slow path.** It runs
+  `gpu_compress_batch` once *per oversized key*, so it pays that ~3–5 ms
+  per-call cost per key (~5M ns/digest, down from ~10M). Avoid it by keeping
+  keys ≤ `BLOCK_CAP` samples per batch.
 
-**Crossover verdict.** Grouped one-block-per-key is now **at the crossover**
-(roughly 1× at ~1,000 samples/key and thousands of keys). Batched single-digest
-has **no crossover yet**. The next step (deferred) is to stop round-tripping per
-tile: launch **all first-pass tiles in one multi-block kernel** (the grouped
-kernel already does this for keys), keep intermediates **device-resident** across
-reduction passes, and move the **sort onto the GPU**.
+**Crossover verdict.**
 
-**Dispatch guidance.** `add_batch` keeps its conservative CPU fallback (the 50k
-crossover) because the batched GPU path does not win on throughput. For
-`GroupedTDigest`, the GPU path is competitive when keys carry hundreds to ~1,000
-samples per batch; with very small per-key batches the CPU is faster.
+- **Single-digest `add_batch`:** crossover at **~150k points per batch**; the GPU
+  is 1.2–1.5× faster above it.
+- **Grouped one-block-per-key:** at break-even (~1×) with ~1,000 samples per key
+  and thousands of keys.
+
+**Dispatch guidance.** `TDigest.add_batch` now switches to the GPU at **150k**
+points (`_GPU_CROSSOVER`, raised from the provisional 50k based on these
+measurements); below that it uses the CPU path. For `GroupedTDigest`, the GPU
+path is competitive when keys carry hundreds to ~1,000 samples per batch; with
+very small per-key batches the CPU is faster.
 
 ---
 
@@ -284,7 +362,7 @@ samples per batch; with very small per-key batches the CPU is faster.
 | Throughput | How fast is `add`? | ~75–140 ns/add; `K0` fastest, cost grows with `δ`. |
 | Accuracy | How accurate are quantiles? | `K2`/`K3` give ppm-level tails; `K1` balanced; `K0` weak tails. |
 | Seasonal | Does decay track drift? | Short half-life (≈ period/50) tracks a drifting signal ~6.6× better than no decay. |
-| GPU crossover | Is the GPU as accurate / faster? | **Accuracy:** GPU matches CPU and is sharper in the tail (p99 err ~2–5e-5 vs ~1–3e-4). **Speed:** grouped one-block-per-key is at break-even (0.84–1.03× at ~1,000 samples/key); batched single-digest is flat at ~4 µs/pt (37× faster than before) but still ~40× slower than CPU. |
+| GPU crossover | Is the GPU as accurate / faster? | **Accuracy:** GPU matches CPU and is sharper in the tail (p99 err ~2–5e-5 vs ~1–3e-4). **Speed:** single-digest `add_batch` beats the CPU above ~150k points (1.2–1.5×, ~60 ns/pt at 1M after moving sort + tiling onto the GPU); grouped one-block-per-key is at break-even (0.84–1.03× at ~1,000 samples/key). |
 
 These mirror the quality/benchmark split in the
 [tdunning/t-digest](https://github.com/tdunning/t-digest) reference, extended

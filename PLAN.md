@@ -464,11 +464,17 @@ documents the batch-size and key-count crossovers where GPU beats CPU.
     one-block-per-key is at break-even (0.84–1.03× at ~1,000 samples/key). The
     original grouped benchmark rows had 2,000 samples/key and so only ever
     measured the oversized-key fallback.
-  - *Verdict / Open Design Question #5:* `add_batch` keeps its conservative CPU
-    fallback (50k crossover). Remaining deferred work to win on speed: launch
-    all first-pass tiles in **one multi-block kernel** instead of a per-tile
-    upload/launch/readback loop, keep intermediates **device-resident** across
-    reduction passes, and move the **sort onto the GPU**.
+  - *Verdict / Open Design Question #5 (after step 3):* sort and tiling now run
+    on the GPU — a stable device sort (`kdigest.gpu.sort`: per-tile bitonic +
+    merge passes) and one multi-block compress launch per pass with a
+    device-side gather. The host reads back only per-pass survivor counts and
+    the final centroids. Centroid means are clamped to their segment range so
+    survivors stay sorted, making re-sorting between passes unnecessary. All
+    three paths (per-tile reference, part A, part B) are bit-identical. Result:
+    **~60 ns/pt at 1M vs ~90 ns/pt CPU (1.5×); crossover ~150k points.**
+    `_GPU_CROSSOVER` raised from the provisional 50k to 150k. Remaining fixed
+    cost (~3 ms per call: buffer allocation + per-pass syncs) is what keeps
+    small batches on the CPU.
 
 ---
 

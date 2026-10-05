@@ -46,9 +46,10 @@ comptime _RENORM_LOG_THRESHOLD = 400.0
 comptime _PRUNE_EPSILON = 1e-6
 
 # add_batch dispatches to the GPU only above this batch size; below it the fixed
-# host<->device transfer cost dominates, so the CPU buffer path is faster. The
-# precise crossover is characterized in Stage 5f; this is a safe default.
-comptime _GPU_CROSSOVER = 50_000
+# launch / transfer cost dominates, so the CPU buffer path is faster. Measured
+# in bench/bench_gpu.mojo (Apple silicon, device-resident pipeline): the GPU is
+# 0.89x the CPU at 100k points and 1.21x at 200k, so break-even sits in between.
+comptime _GPU_CROSSOVER = 150_000
 
 # Serialization format version, written as the first byte of `to_bytes`.
 comptime _SERDE_VERSION: UInt8 = 1

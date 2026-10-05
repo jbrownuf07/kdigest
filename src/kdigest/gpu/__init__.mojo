@@ -20,6 +20,11 @@ from kdigest.gpu.primitives import (
     cpu_compact,
 )
 from kdigest.gpu.scale_device import gpu_scale_eval
-from kdigest.gpu.add_batch import gpu_compress_batch
+from kdigest.gpu.add_batch import (
+    gpu_compress_batch,
+    gpu_compress_batch_host_sort,
+    gpu_compress_batch_host_tiled,
+)
+from kdigest.gpu.sort import gpu_sort_by_mean
 from kdigest.gpu.grouped import gpu_grouped_compress, GroupedResult
 from kdigest.gpu.query import gpu_quantile, gpu_cdf, gpu_merge_digests
