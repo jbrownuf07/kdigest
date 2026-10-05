@@ -254,6 +254,128 @@ throughput beats CPU above the crossover point.
 
 ---
 
+## Phase 6 — DDSketch backend (guaranteed relative-value error)
+
+t-digest gives empirically excellent tail accuracy but no hard guarantee.
+[DDSketch](https://arxiv.org/abs/1908.10693) (Datadog) is its closest sibling
+with a **provable relative-value error** bound and **lossless merge**, making it
+a strong complement — and a cleaner fit for the Phase 5 GPU fan-out (merging is
+just adding bucket counts). This phase adds it as an *alternative backend behind
+a shared trait*, mirroring how scale functions are already pluggable.
+
+**Core idea**
+
+Values are placed into logarithmic buckets with index `i = ceil(log_γ(x))`,
+where `γ = (1 + α) / (1 − α)` for a target relative accuracy `α`. Every value
+then sits within an `α`-relative band of its bucket boundary, so for any `q` the
+returned value `v` satisfies `|v − v_true| ≤ α · v_true`. Negative values go in a
+mirrored bucket store; zeros (and a configurable near-zero band) are counted
+separately.
+
+**Deliverables**
+
+- `quantile_sketch.mojo`: a `QuantileSketch` trait capturing the common surface
+  — `add(x, weight)`, `quantile(q)`, `cdf(x)`, `merge_into(other)`,
+  `total_weight()`, `to_bytes()`. Make the existing `TDigest` conform (no
+  behavior change) so the two backends are interchangeable.
+- `ddsketch.mojo`: `DDSketch` with a positive and a negative `BucketStore`
+  (a dense array keyed by bucket index with a tracked offset), a zero counter,
+  and the mapping `α ↔ γ`.
+- Decay integration: reuse the Phase 3 lazy running-scale-factor over bucket
+  *counts* (buckets are just weighted counts), including renormalization and
+  pruning of buckets whose effective count falls below `ε`.
+- Collapsing bound: cap the number of buckets (like the reference's
+  `collapsingLowest/Highest` stores) so memory stays bounded on wide ranges;
+  collapsing degrades the guarantee gracefully at the far tail only.
+
+**Algorithm sketch**
+
+1. **add:** route by sign, compute `i = ceil(log(|x|) / log(γ))`, increment that
+   bucket's (possibly decayed) count; update min/max and total.
+2. **quantile:** scan buckets accumulating count until reaching `q · n`, then
+   return the bucket's representative value `2·γ^i / (γ + 1)` (the band
+   midpoint), negated for the negative store.
+3. **cdf:** inverse scan.
+4. **merge_into:** align bucket-index offsets and add counts — exact, no
+   re-binning.
+
+**Tests (`test_ddsketch.mojo`)**
+
+- **Guarantee check:** for `α = 0.01`, assert every estimated quantile is within
+  `α` *relative* error of the brute-force exact quantile across uniform, normal,
+  exponential, and Pareto — a stronger assertion than t-digest's empirical
+  bound.
+- **Lossless merge:** `ddsketch(A ∪ B)` is *bucket-for-bucket identical* to
+  `ddsketch(A).merge_into(ddsketch(B))` (not just approximately equal).
+- **Decay drift:** same `N(0,1) → N(10,1)` drift test as Phase 3.
+- **Memory bound:** bucket count stays within the collapsing cap under a
+  wide-range stream.
+- **Trait interchange:** the same generic test driver runs over both `TDigest`
+  and `DDSketch` through `QuantileSketch`.
+
+**Done when:** DDSketch meets its relative-error guarantee on all test
+distributions, merges losslessly, and is drop-in via the `QuantileSketch` trait.
+
+---
+
+## Phase 7 — KLL sketch (provable rank error, optimal space)
+
+For workloads needing a *provable rank-error* bound (`ε` such that the returned
+item's true rank is within `εN`) on arbitrary ordered data — no value-range or
+sign assumptions — [KLL](https://arxiv.org/abs/1603.05346) is the
+asymptotically space-optimal comparison-based sketch and the basis of Apache
+DataSketches. It is a genuinely different structure (randomized compactors), so
+it ships as a third backend under the same `QuantileSketch` trait.
+
+**Core idea**
+
+A stack of **compactors** (sorted buffers), one per level. When a level fills,
+it *compacts*: sort, then keep either the even- or odd-indexed items (chosen by a
+fair coin) and promote them to the next level with doubled weight. Lower levels
+use smaller capacities (geometric decay with factor `c ≈ 2/3`), concentrating
+resolution where it is cheap. Space is
+`O((1/ε) · log log (1/ε))`, with randomized rank error `εN` w.h.p.
+
+**Deliverables**
+
+- `kll.mojo`: `KLLSketch` holding a `List` of compactor levels, the per-level
+  capacity schedule derived from a target `k` (⇔ `ε`), and the running item
+  count.
+- Operations: `add(x, weight)` (unit weight; fractional/weighted via repetition
+  or a weighted-KLL extension noted below), `quantile(q)`, `cdf(x)`,
+  `merge_into(other)` (level-wise compactor merge), `to_bytes()`.
+- A deterministic-seed RNG hook so tests are reproducible.
+
+**Algorithm sketch**
+
+1. **add:** push into level 0; if full, compact upward, cascading as needed.
+2. **quantile/cdf:** gather all retained items with their level weights
+   (`2^level`), sort by value, and walk the weighted cumulative distribution.
+3. **merge_into:** concatenate same-level compactors and re-compact overflowing
+   levels; grow the level stack to the max of the two.
+
+**Open sub-questions (resolve in-phase)**
+
+- **Weighted/decayed inputs.** KLL is natively unit-weight. Options: (a) expand
+  integer weights, (b) a weighted-KLL variant, (c) document KLL as the
+  unweighted/undecayed backend and keep decay a t-digest/DDSketch feature. Pick
+  one; (c) is the likely default.
+
+**Tests (`test_kll.mojo`)**
+
+- **Rank-error guarantee:** over many trials with a fixed seed, assert the
+  empirical rank error stays within `εN` at the target failure probability for
+  uniform/normal/exponential/Pareto.
+- **Merge equivalence:** `kll(A ∪ B)` ≈ `kll(A).merge_into(kll(B))` within the
+  rank bound.
+- **Space bound:** total retained items match the `k`-derived capacity schedule.
+- **Trait interchange:** runs through the shared `QuantileSketch` driver.
+
+**Done when:** KLL meets its rank-error guarantee within the target failure
+probability, merges correctly, and is drop-in via the `QuantileSketch` trait.
+
+---
+
 ## Open design questions
 
 1. **MergingDigest vs. AVLTreeDigest.** Plan targets `MergingDigest` (simpler,
@@ -268,6 +390,17 @@ throughput beats CPU above the crossover point.
    later for `Float32` streams (also eases the GPU port in Phase 5).
 5. **GPU crossover threshold.** Determine the batch size / digest count at which
    the Phase 5 GPU path beats CPU, and whether to auto-dispatch based on it.
+6. **Error semantics across backends.** t-digest = empirical tail accuracy;
+   DDSketch = guaranteed relative-*value* error; KLL = guaranteed *rank* error.
+   The `QuantileSketch` trait unifies the API but not the guarantee — document
+   per-backend semantics and let callers choose by requirement.
+7. **Decay × backend.** Exponential decay is natural for t-digest and DDSketch
+   (weighted counts) but awkward for KLL (unit-weight compactors). Decide whether
+   decay is a backend-specific capability or a uniform promise (see Phase 7).
+8. **Hard sliding window vs. smooth decay.** Current decay smoothly down-weights
+   the past; it cannot express "exactly the last N / last T". If users need a
+   hard window, that is a separate mechanism (exponential-histogram style), not a
+   decay rate — scope it only if demand appears.
 
 ---
 
@@ -281,3 +414,5 @@ throughput beats CPU above the crossover point.
 | 3 | Exponential decay (rate / half-life) | Recency weighting |
 | 4 | Hardened, serialized, benchmarked | Production readiness |
 | 5 | Batched + grouped GPU backend behind same API | GPU acceleration |
+| 6 | DDSketch backend behind a `QuantileSketch` trait | Guaranteed relative-value error |
+| 7 | KLL sketch backend behind the same trait | Provable rank error, optimal space |
