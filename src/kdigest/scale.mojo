@@ -51,6 +51,10 @@ trait ScaleFunction(Deinitable, ImplicitlyCopyable, Movable):
     """A t-digest scale function and its inverse, generic over `DT`."""
 
     comptime DT: DType
+    # The Float32 counterpart of this scale function (same formulas, fp32). Used
+    # to drive the GPU backend from a Float64 digest without hard-coding which
+    # Kn is in play.
+    comptime F32: ScaleFunction
 
     def __init__(out self):
         ...
@@ -77,6 +81,7 @@ struct ScaleK0Impl[dtype: DType = DType.float64](ScaleFunction):
     """
 
     comptime DT = Self.dtype
+    comptime F32 = ScaleK0Impl[DType.float32]
 
     def normalizer(
         self, compression: Scalar[Self.DT], n: Scalar[Self.DT]
@@ -99,6 +104,7 @@ struct ScaleK1Impl[dtype: DType = DType.float64](ScaleFunction):
     """Classic t-digest scale: k = normalizer * asin(2q - 1)."""
 
     comptime DT = Self.dtype
+    comptime F32 = ScaleK1Impl[DType.float32]
 
     def normalizer(
         self, compression: Scalar[Self.DT], n: Scalar[Self.DT]
@@ -128,6 +134,7 @@ struct ScaleK2Impl[dtype: DType = DType.float64](ScaleFunction):
     """
 
     comptime DT = Self.dtype
+    comptime F32 = ScaleK2Impl[DType.float32]
 
     def normalizer(
         self, compression: Scalar[Self.DT], n: Scalar[Self.DT]
@@ -159,6 +166,7 @@ struct ScaleK3Impl[dtype: DType = DType.float64](ScaleFunction):
     """
 
     comptime DT = Self.dtype
+    comptime F32 = ScaleK3Impl[DType.float32]
 
     def normalizer(
         self, compression: Scalar[Self.DT], n: Scalar[Self.DT]

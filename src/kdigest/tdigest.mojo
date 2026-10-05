@@ -21,6 +21,7 @@ Example:
 
 from std.math import exp, isnan, isinf
 from std.memory import bitcast
+from std.sys import has_accelerator
 
 from kdigest.centroid import Centroid
 
@@ -29,6 +30,7 @@ from kdigest.centroid import Centroid
 comptime _Centroid = Centroid[DType.float64]
 from kdigest.decay import Decay
 from kdigest.scale import ScaleFunction, ScaleK1
+from kdigest.gpu.add_batch import gpu_compress_batch
 
 
 # Buffer size as a multiple of compression. The reference uses a buffer several
@@ -42,6 +44,11 @@ comptime _RENORM_LOG_THRESHOLD = 400.0
 # Effective-weight floor: centroids lighter than this are pruned after a merge
 # when decay is active, bounding memory on indefinite streams.
 comptime _PRUNE_EPSILON = 1e-6
+
+# add_batch dispatches to the GPU only above this batch size; below it the fixed
+# host<->device transfer cost dominates, so the CPU buffer path is faster. The
+# precise crossover is characterized in Stage 5f; this is a safe default.
+comptime _GPU_CROSSOVER = 50_000
 
 # Serialization format version, written as the first byte of `to_bytes`.
 comptime _SERDE_VERSION: UInt8 = 1
@@ -159,6 +166,94 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized) where (
         if timestamp > self._clock:
             self._advance_clock(timestamp)
         self._insert(value, weight)
+
+    def add_batch(
+        mut self, values: List[Float64]
+    ) raises where Self.S.F32.DT == DType.float32:
+        """Fold a whole batch of unit-weight samples in at once.
+
+        Semantically equivalent to calling `add(v)` for each `v` in `values`:
+        the batch advances the clock by `len(values)` ticks (so count-based
+        decay matches the one-at-a-time path), and the resulting quantiles agree
+        with the scalar path within tolerance.
+
+        When an accelerator is present and the batch is large enough to amortize
+        the host<->device transfer (`len(values) >= _GPU_CROSSOVER`), the merge
+        runs on the GPU with the parallel k-bucketing formulation. Otherwise it
+        falls back to the proven CPU `add` loop. The GPU path is Float32, so its
+        quantiles match the Float64 CPU path to fp32 tolerance rather than bit
+        for bit.
+        """
+        var n = len(values)
+        if n == 0:
+            return
+
+        comptime gpu_available = has_accelerator()
+        if not gpu_available or n < _GPU_CROSSOVER:
+            for i in range(n):
+                self.add(values[i])
+            return
+
+        # Validate up front (the GPU kernel assumes finite inputs).
+        for i in range(n):
+            self._validate(values[i], 1.0)
+
+        # The batch occupies one clock span; advance once and scale the new
+        # weights by the current decay factor, exactly as `_insert` would.
+        self._advance_clock(self._clock + Float64(n))
+        var scale_factor = self._scale_factor()
+
+        # Assemble (mean, weight) in Float32: existing centroids (already
+        # scaled) + the new samples (scaled on the way in).
+        var means = List[Float32]()
+        var weights = List[Float32]()
+        for i in range(len(self._centroids)):
+            means.append(Float32(self._centroids[i].mean))
+            weights.append(Float32(self._centroids[i].weight))
+        for i in range(len(self._buffer)):
+            means.append(Float32(self._buffer[i].mean))
+            weights.append(Float32(self._buffer[i].weight))
+        self._buffer = List[_Centroid]()
+        var vmin = values[0]
+        var vmax = values[0]
+        for i in range(n):
+            var v = values[i]
+            means.append(Float32(v))
+            weights.append(Float32(scale_factor))
+            if v < vmin:
+                vmin = v
+            if v > vmax:
+                vmax = v
+        self._stored_total += Float64(n) * scale_factor
+
+        # Track running min/max across the whole stream.
+        if (
+            self._stored_total == Float64(n) * scale_factor
+            and len(self._centroids) == 0
+        ):
+            self._min = vmin
+            self._max = vmax
+        else:
+            if vmin < self._min:
+                self._min = vmin
+            if vmax > self._max:
+                self._max = vmax
+
+        var out = gpu_compress_batch[Self.S.F32](
+            means, weights, Float32(self.compression)
+        )
+        var new_centroids = List[_Centroid]()
+        var total = 0.0
+        for i in range(len(out[0])):
+            var wt = Float64(out[1][i])
+            new_centroids.append(_Centroid(mean=Float64(out[0][i]), weight=wt))
+            total += wt
+        self._centroids = new_centroids^
+        # Reconcile the stored total with the compressed weights (fp32 rounding
+        # can nudge it slightly).
+        self._stored_total = total
+        if self._decay.is_active():
+            self._prune()
 
     @staticmethod
     def _validate(value: Float64, weight: Float64) raises:

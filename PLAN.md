@@ -346,6 +346,32 @@ Pareto; include a decayed-stream parity case.
 **Done when:** single-digest GPU results match the CPU reference within tolerance
 for all scale functions, with and without decay.
 
+**Outcome.** `TDigest.add_batch(values)` dispatches to the GPU when
+`has_accelerator()` and `len >= _GPU_CROSSOVER` (50k, a safe default pending the
+Stage 5f crossover sweep), else runs the exact CPU `add` loop. A batch shares one
+clock advance of `len(values)` ticks, so count-based decay matches the
+sample-at-a-time path; new-sample weights get the current decay scale factor.
+
+The GPU merge uses the **parallel k-bucketing** formulation (chosen over the
+sequential sweep): prefix-sum weights → `cluster_id = floor(k(cum/W))` →
+head-flag → segmented reduce (Σw, Σw·mean) → compact. This is a different but
+equally valid clustering, so it does not reproduce the CPU centroids bit for bit.
+Implemented as one fused single-block kernel (`gpu/add_batch.mojo`); the host
+wrapper sorts + tiles arbitrary-length batches and reduces partials
+hierarchically until a final block fits. The float64 digest drives the float32
+GPU scale via a new `ScaleFunction.F32` associated alias (`S.F32` =
+`ScaleKnImpl[float32]`), bridged with `rebind` under `where S.F32.DT == float32`.
+
+Parity policy (per the chosen "truth" framing): both the CPU **and** GPU
+estimates are checked against the *true* empirical quantile at p0.1/p50/p99.9,
+each required to fall inside a per-scale accuracy band. This surfaced a real,
+documented property — the parallel merge resolves the extreme tail a bit more
+loosely than the sequential sweep, worst for weak-tail scales. Coverage: K1/K2/K3
+over uniform/normal/exponential/Pareto; K0 (linear, weakest tails *by design* —
+even its CPU digest is ~8× off at Pareto p99.9) tested on uniform where it is
+meaningful; a decayed-stream case; and an exact CPU==add-loop check below the
+crossover. 6 new tests, **80 total**, GPU tests gated on `has_accelerator()`.
+
 ---
 
 ### Stage 5e — Grouped multi-digest (the headline win)
