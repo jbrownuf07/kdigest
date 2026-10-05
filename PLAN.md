@@ -432,6 +432,37 @@ and correctness is independent of key count.
 **Done when:** query/merge kernels match the CPU reference, and the benchmark
 documents the batch-size and key-count crossovers where GPU beats CPU.
 
+**Outcome (done):** Implemented and green (87/87 suite).
+
+- `src/kdigest/gpu/query.mojo` —
+  - `gpu_quantile` / `gpu_cdf`: a **parallel map**, one GPU thread per query,
+    interpolating one compressed digest. Centroids (<= `BLOCK_CAP`) are staged
+    into shared memory and reused by every thread in the block. The per-thread
+    interpolation mirrors `TDigest.quantile` / `.cdf` exactly, so results agree
+    with the CPU to fp32 rounding (tests: 1e-4 band on a full p0.1→p99.9 panel
+    and a 25-point CDF sweep).
+  - `gpu_merge_digests[S]`: the **mergeable reduce** — gather all partial
+    digests' centroids and compress the union once via `gpu_compress_batch`.
+    This is the associative fold behind map-reduce finalization. Test merges 4
+    shard digests and matches a single digest over the concatenated raw data.
+- `bench/bench_gpu.mojo` (`pixi run bench-gpu`) — the crossover study, swept over
+  batch size (1k→1M) and key count (16→256). **Findings, documented honestly in
+  `bench/Benchmark.md` §4:**
+  - *Accuracy:* the parallel GPU compress matches the CPU and is **sharper in the
+    tail** (p99 rank error ~2e-5–5e-5 vs the CPU sweep's ~1e-4–3e-4).
+  - *Speed:* the current correctness-first backend is **~60–1600× slower** than
+    the CPU and shows **no crossover** in range — it is setup/transfer-bound
+    (per-call `DeviceContext`, host↔device `map_to_host`, serial host-side
+    tiling), not compute-bound. The per-call context creation also leaks Metal
+    command queues under tight loops.
+  - *Verdict / Open Design Question #5:* `add_batch` / `GroupedTDigest` keep
+    their conservative CPU fallback (50k crossover for `add_batch`) because the
+    GPU does not yet win on throughput. The value today is accuracy and a
+    correct, mergeable, GPU-resident data path (compress → query → merge).
+    Winning on speed is deferred future work: a **persistent `DeviceContext`**,
+    **device-resident buffers** across compress/query/merge, and a **parallel
+    multi-block sort** to replace the host-side tiling.
+
 ---
 
 **Phase-level done when:** GPU results match the CPU reference within tolerance

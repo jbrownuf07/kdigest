@@ -6,7 +6,8 @@ what each one measures and why, and a snapshot of representative results.
 Run them with:
 
 ```bash
-pixi run bench
+pixi run bench       # CPU: throughput, accuracy, seasonal (Sections 1–3)
+pixi run bench-gpu   # GPU: accuracy + CPU/GPU crossover (Section 4; needs an accelerator)
 ```
 
 All numbers below were captured on an Apple-silicon (`osx-arm64`) dev box with
@@ -150,6 +151,87 @@ longer than the period and decay buys you almost nothing over a plain digest.
 
 ---
 
+## 4. GPU backend — accuracy and the CPU/GPU crossover
+
+**What it measures.** The Phase 5 GPU backend (`add_batch`, `GroupedTDigest`,
+vectorized query, merge-tree) uses a *parallel* k-bucketing compress instead of
+the CPU's sequential greedy sweep. This benchmark
+([`bench/bench_gpu.mojo`](./bench_gpu.mojo), `pixi run bench-gpu`) answers two
+questions side by side: **is the GPU result as accurate**, and **when (if ever)
+is it faster** than the CPU on the current implementation.
+
+All GPU numbers are Float32 (the device dtype); CPU is Float64. Captured on an
+Apple-silicon (`osx-arm64`) dev box. **These are not an SLA** — they exist to
+locate the break-even points and to be honest about where the backend stands.
+
+### 4a. Batched single-digest — `gpu_compress_batch` vs CPU `add` loop
+
+Folding one batch into one digest, swept over batch size. "ns/pt" is wall-clock
+nanoseconds per input point (lower is better); "err" is the rank error vs. the
+exact quantile (lower is better).
+
+| N | GPU ns/pt | CPU ns/pt | speedup | GPU p50 err | CPU p50 err | GPU p99 err | CPU p99 err |
+| --------- | --------- | --------- | ------- | ----------- | ----------- | ----------- | ----------- |
+| 1,000 | ~12,100 | ~92 | 0.008× | 0.0 | 1.0e-3 | 1.0e-3 | 1.0e-3 |
+| 10,000 | ~5,400 | ~89 | 0.016× | 1.1e-3 | 2.4e-3 | 1.0e-4 | 3.0e-4 |
+| 50,000 | ~10,700 | ~91 | 0.009× | 7.8e-4 | 2.0e-5 | 2.0e-5 | 2.2e-4 |
+| 100,000 | ~17,500 | ~89 | 0.005× | 6.5e-4 | 2.1e-4 | 2.0e-5 | 1.1e-4 |
+| 500,000 | ~73,900 | ~91 | 0.001× | 2.8e-4 | 2.1e-3 | 2.2e-5 | 7.6e-5 |
+| 1,000,000 | ~144,700 | ~92 | 0.001× | 7.4e-5 | 1.8e-3 | 5.2e-5 | 3.0e-4 |
+
+### 4b. Grouped multi-digest — `gpu_grouped_compress` vs CPU per-key loop
+
+Thousands of independent per-key digests. "ns/digest" is wall-clock time divided
+by the number of keys (one GPU block per key, single launch).
+
+| keys × samples/key | GPU ns/digest | CPU ns/digest | speedup |
+| ------------------ | ------------- | ------------- | ------- |
+| 16 × 2,000 | ~11.8M | ~177k | 0.015× |
+| 64 × 2,000 | ~11.5M | ~179k | 0.016× |
+| 256 × 2,000 | ~12.9M | ~175k | 0.014× |
+
+**Reading the results — accuracy is the win, speed is not (yet).**
+
+- **Accuracy.** The parallel GPU compress is *at least as accurate* as the CPU
+  digest, and consistently **sharper in the tail**: GPU `p99` rank error sits at
+  `2e-5–5e-5` across all sizes, versus `1e-4–3e-4` for the sequential CPU sweep.
+  The parallel k-bucketing is a valid-but-different clustering (see Stage 5d/5e),
+  and on these distributions it resolves the extremes slightly better. The `p50`
+  is comparable; neither side dominates at the median.
+- **Speed.** On this implementation the GPU is **~60–1600× slower** than the CPU
+  for both batched and grouped work, and its per-point cost *grows* with N. The
+  cost is dominated not by compute but by **per-call device setup, host↔device
+  buffer maps, and the serial host-side tiling/transfer loop** — each
+  `gpu_compress_batch` call spins up a fresh `DeviceContext`, uploads via
+  `map_to_host`, launches many single-block tiles, and reads results back. The
+  CPU `add` loop, by contrast, is a tight in-cache append + periodic merge at
+  ~90 ns/pt.
+- **Grouped overhead is fixed, not per-key.** GPU wall-time is roughly constant
+  (~12 ms) regardless of key count, so ns/digest *falls* as keys grow — the
+  launch/transfer overhead amortizes across more digests. Extrapolating the flat
+  ~12 ms against the CPU's ~175 µs/digest, the grouped crossover would land near
+  **~70,000 keys** in a single launch *if* the fixed overhead stays flat — which
+  it will not without the optimizations below.
+
+**Crossover verdict.** With the current correctness-first backend there is **no
+batch size or key count in the tested range where the GPU beats the CPU on
+speed**. The backend's value today is (1) **accuracy**, especially tail fidelity,
+and (2) a **correct, mergeable, GPU-resident data path** (compress → query →
+merge) that the throughput work can build on. Closing the speed gap requires a
+**persistent `DeviceContext`** (reused across calls rather than created per
+call — the per-call creation also leaks Metal command queues under tight loops),
+**device-resident buffers** that stay on the GPU between compress/query/merge
+instead of round-tripping to the host, and a **parallel multi-block sort** to
+replace the serial host-side tiling. Those are deliberately deferred; this stage
+establishes the honest baseline and the measurement harness to track them.
+
+**Dispatch guidance.** `add_batch` / `GroupedTDigest` keep a conservative CPU
+fallback (the 50k crossover for `add_batch`) precisely because the GPU does not
+yet win on throughput. Use the GPU path today when you want its tail accuracy or
+a GPU-resident pipeline; use the CPU path for latency.
+
+---
+
 ## Summary
 
 | Benchmark | Question it answers | Key takeaway |
@@ -157,7 +239,10 @@ longer than the period and decay buys you almost nothing over a plain digest.
 | Throughput | How fast is `add`? | ~75–140 ns/add; `K0` fastest, cost grows with `δ`. |
 | Accuracy | How accurate are quantiles? | `K2`/`K3` give ppm-level tails; `K1` balanced; `K0` weak tails. |
 | Seasonal | Does decay track drift? | Short half-life (≈ period/50) tracks a drifting signal ~6.6× better than no decay. |
+| GPU crossover | Is the GPU as accurate / faster? | **Accuracy:** GPU matches CPU and is sharper in the tail (p99 err ~2–5e-5 vs ~1–3e-4). **Speed:** current backend is ~60–1600× *slower* (setup/transfer-bound); no crossover yet — needs a persistent context, device-resident buffers, and a parallel sort. |
 
 These mirror the quality/benchmark split in the
 [tdunning/t-digest](https://github.com/tdunning/t-digest) reference, extended
-with the recency-tracking scenario that motivates kdigest's decay feature.
+with the recency-tracking scenario that motivates kdigest's decay feature and a
+GPU crossover study that locates where the Phase 5 accelerator does — and does
+not — pay off.
