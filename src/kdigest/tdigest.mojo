@@ -19,7 +19,8 @@ Example:
     var p999 = d.quantile(0.999)
 """
 
-from std.math import exp
+from std.math import exp, isnan, isinf
+from std.memory import bitcast
 
 from kdigest.centroid import Centroid
 from kdigest.decay import Decay
@@ -38,6 +39,9 @@ comptime _RENORM_LOG_THRESHOLD = 400.0
 # when decay is active, bounding memory on indefinite streams.
 comptime _PRUNE_EPSILON = 1e-6
 
+# Serialization format version, written as the first byte of `to_bytes`.
+comptime _SERDE_VERSION: UInt8 = 1
+
 
 def _sort_centroids(mut cs: List[Centroid]):
     """In-place sort of centroids by mean (insertion sort).
@@ -53,6 +57,23 @@ def _sort_centroids(mut cs: List[Centroid]):
             cs[j + 1] = cs[j]
             j -= 1
         cs[j + 1] = key
+
+
+def _put_f64(mut out: List[UInt8], value: Float64):
+    """Append `value` as 8 little-endian bytes of its IEEE-754 bit pattern."""
+    var bits = UInt64(value.to_bits())
+    for i in range(8):
+        out.append(UInt8((bits >> UInt64(8 * i)) & UInt64(0xFF)))
+
+
+def _get_f64(data: List[UInt8], offset: Int) raises -> Float64:
+    """Read a little-endian Float64 at `offset` (8 bytes)."""
+    if offset + 8 > len(data):
+        raise Error("truncated digest: not enough bytes for a Float64")
+    var bits = UInt64(0)
+    for i in range(8):
+        bits |= UInt64(data[offset + i]) << UInt64(8 * i)
+    return bitcast[DType.float64, 1](bits)
 
 
 struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
@@ -104,25 +125,36 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
         self._min = 0.0
         self._max = 0.0
 
-    def add(mut self, value: Float64, weight: Float64 = 1.0):
+    def add(mut self, value: Float64, weight: Float64 = 1.0) raises:
         """Add one (optionally weighted) sample, advancing the clock by one tick.
 
-        Use this for count-based decay (one unit of time per sample).
+        Use this for count-based decay (one unit of time per sample). Rejects
+        NaN/inf values and non-positive weights.
         """
+        self._validate(value, weight)
         self._advance_clock(self._clock + 1.0)
         self._insert(value, weight)
 
     def add_at(
         mut self, value: Float64, timestamp: Float64, weight: Float64 = 1.0
-    ):
+    ) raises:
         """Add a sample observed at `timestamp` for time-based decay.
 
         Timestamps must be non-decreasing across calls; the clock jumps to
-        `timestamp` and decays prior mass by the elapsed interval.
+        `timestamp` and decays prior mass by the elapsed interval. Rejects
+        NaN/inf values and non-positive weights.
         """
+        self._validate(value, weight)
         if timestamp > self._clock:
             self._advance_clock(timestamp)
         self._insert(value, weight)
+
+    @staticmethod
+    def _validate(value: Float64, weight: Float64) raises:
+        if isnan(value) or isinf(value):
+            raise Error("value must be finite (got NaN or inf)")
+        if weight <= 0.0 or isnan(weight) or isinf(weight):
+            raise Error("weight must be positive and finite")
 
     def _advance_clock(mut self, new_clock: Float64):
         """Move the clock to `new_clock`, growing the decay exponent."""
@@ -217,7 +249,9 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
             var k_span = self._scale.k(q_right, nrm) - self._scale.k(
                 q_left, nrm
             )
-            if k_span <= 1.0:
+            # Always coalesce exact-tie means (e.g. all-identical streams), and
+            # otherwise grow the cluster while it fits in the k-size budget.
+            if candidate.mean == current.mean or k_span <= 1.0:
                 current.merge(candidate)
             else:
                 merged.append(current)
@@ -412,3 +446,78 @@ struct TDigest[S: ScaleFunction](Copyable, Movable, Sized):
             self._max = max(self._max, other._max)
         self._clock = max(self._clock, other._clock)
         self.merge()
+
+    # --- Serialization -------------------------------------------------------
+
+    def to_bytes(mut self) -> List[UInt8]:
+        """Serialize the digest to a portable little-endian byte buffer.
+
+        The buffer can be persisted or shipped to another process and restored
+        with `from_bytes`. The scale function has no runtime state, so it is not
+        stored; the reader must supply the same scale type parameter.
+
+        Layout: [version:u8] then little-endian Float64s:
+          compression, decay λ, _log_scale, _clock, _stored_total, min, max,
+          centroid_count, then (mean, weight) per centroid.
+        """
+        self.merge()
+        var out = List[UInt8]()
+        out.append(_SERDE_VERSION)
+        _put_f64(out, self.compression)
+        _put_f64(out, self._decay.rate_lambda)
+        _put_f64(out, self._log_scale)
+        _put_f64(out, self._clock)
+        _put_f64(out, self._stored_total)
+        _put_f64(out, self._min)
+        _put_f64(out, self._max)
+        _put_f64(out, Float64(len(self._centroids)))
+        for i in range(len(self._centroids)):
+            _put_f64(out, self._centroids[i].mean)
+            _put_f64(out, self._centroids[i].weight)
+        return out^
+
+    @staticmethod
+    def from_bytes(data: List[UInt8], scale: Self.S = Self.S()) raises -> Self:
+        """Reconstruct a digest from `to_bytes` output.
+
+        `scale` must be the same scale function the digest was built with (its
+        type is a compile-time parameter and is not stored in the buffer).
+        """
+        if len(data) == 0 or data[0] != _SERDE_VERSION:
+            raise Error("unrecognized digest serialization version")
+
+        var off = 1
+        var compression = _get_f64(data, off)
+        off += 8
+        var rate_lambda = _get_f64(data, off)
+        off += 8
+        var log_scale = _get_f64(data, off)
+        off += 8
+        var clock = _get_f64(data, off)
+        off += 8
+        var stored_total = _get_f64(data, off)
+        off += 8
+        var min_v = _get_f64(data, off)
+        off += 8
+        var max_v = _get_f64(data, off)
+        off += 8
+        var count = Int(_get_f64(data, off))
+        off += 8
+
+        var result = Self(
+            compression=compression,
+            scale=scale,
+            decay=Decay.rate(rate_lambda),
+        )
+        for _ in range(count):
+            var mean = _get_f64(data, off)
+            off += 8
+            var weight = _get_f64(data, off)
+            off += 8
+            result._centroids.append(Centroid(mean=mean, weight=weight))
+        result._log_scale = log_scale
+        result._clock = clock
+        result._stored_total = stored_total
+        result._min = min_v
+        result._max = max_v
+        return result^

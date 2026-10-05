@@ -17,10 +17,11 @@ it well suited to real-time, non-stationary streams:
    (`k_0`, `k_1`, `k_2`, `k_3`) that controls how cluster sizes are restricted,
    trading median accuracy for tail accuracy.
 
-> Status: **early design / scaffolding.** This repo currently contains the
-> project toolchain (pixi + Mojo), this README, and a phased build plan in
-> [`PLAN.md`](./PLAN.md). The API shown below is the target design, not yet a
-> shipping implementation.
+> Status: **Phases 0–4 implemented.** The library ships the `MergingDigest`
+> core (`add`/`merge`/`quantile`/`cdf`/`merge_into`), four scale functions,
+> exponential decay (rate / half-life), serialization, edge-case hardening, and
+> a benchmark suite. GPU acceleration (Phase 5) is the remaining optional work;
+> see [`PLAN.md`](./PLAN.md). The API below reflects the real shipping API.
 
 ---
 
@@ -51,7 +52,7 @@ single sample), which is exactly what yields accurate tail estimates.
 ### Centroid
 
 ```mojo
-struct Centroid(Copyable, Movable):
+struct Centroid(ImplicitlyCopyable, Movable, Writable):
     var mean: Float64    # cluster mean
     var weight: Float64  # effective count (may be fractional after decay)
 ```
@@ -100,35 +101,41 @@ below a floor, keeping memory bounded.
 
 ---
 
-## Target API
+## Usage
+
+The scale function is a compile-time type parameter; decay and compression are
+runtime arguments.
 
 ```mojo
 from kdigest import TDigest, ScaleK2, Decay
 
 def main() raises:
     # Compression (delta): higher = more centroids = more accuracy.
-    var digest = TDigest(
+    var digest = TDigest[ScaleK2](
         compression=200.0,
-        scale=ScaleK2(),
         decay=Decay.half_life(10_000.0),   # influence halves every 10k samples
     )
 
-    # Stream data in
+    # Stream data in (add raises on NaN/inf or non-positive weight)
     for x in stream:
-        digest.add(x)                      # weight 1.0
+        digest.add(x)                      # weight 1.0, one clock tick
         # digest.add(x, weight=3.0)        # weighted sample
-        # digest.add(x, timestamp=t)       # time-based decay
+        # digest.add_at(x, timestamp=t)    # time-based decay
 
     # Query quantiles — accurate even at the extremes
-    var p50  = digest.quantile(0.50)
+    var p50 = digest.quantile(0.50)
     var p999 = digest.quantile(0.999)
     var p001 = digest.quantile(0.001)
 
     # Inverse query: what fraction of mass is <= x?
-    var cdf  = digest.cdf(x)
+    var cdf = digest.cdf(5.0)
 
     # Merge two digests (map-reduce friendly)
     other.merge_into(digest)
+
+    # Persist / ship across processes
+    var bytes = digest.to_bytes()
+    var restored = TDigest[ScaleK2].from_bytes(bytes)
 
     print("p99.9 =", p999)
 ```
@@ -145,7 +152,7 @@ def main() raises:
 
 ---
 
-## Project layout (planned)
+## Project layout
 
 ```
 kdigest/
@@ -154,18 +161,21 @@ kdigest/
 ├── pixi.toml              # Mojo toolchain (Modular MAX channel)
 ├── scripts/
 │   └── run_tests.sh           # test runner (mojo run over test/test_*.mojo)
+├── bench/
+│   └── bench.mojo             # throughput + accuracy benchmarks         [done]
 ├── src/
 │   └── kdigest/
-│       ├── centroid.mojo      # Centroid value type                    [done]
-│       ├── scale.mojo         # ScaleFunction trait + K0/K1/K2/K3       [done]
-│       ├── decay.mojo         # Decay policy (rate / half-life)         [planned]
-│       ├── tdigest.mojo       # MergingDigest core (add/merge/quantile) [planned]
+│       ├── centroid.mojo      # Centroid value type                     [done]
+│       ├── scale.mojo         # ScaleFunction trait + K0/K1/K2/K3        [done]
+│       ├── decay.mojo         # Decay policy (rate / half-life)          [done]
+│       ├── tdigest.mojo       # MergingDigest core + serialization       [done]
 │       └── __init__.mojo      # public exports
 └── test/
     ├── test_centroid.mojo     # weighted-mean correctness
     ├── test_scale.mojo        # scale function identities & inverses
-    ├── test_tdigest.mojo      # accuracy vs. exact quantiles            [planned]
-    └── test_decay.mojo        # decay behavior on drifting streams      [planned]
+    ├── test_tdigest.mojo      # accuracy vs. exact quantiles             [done]
+    ├── test_decay.mojo        # decay behavior on drifting streams       [done]
+    └── test_edge.mojo         # edge cases + serialization round-trip    [done]
 ```
 
 ---
@@ -179,7 +189,24 @@ pixi install          # resolve the Mojo toolchain
 pixi run test         # run the test suite (mojo run over test/test_*.mojo)
 pixi run fmt          # format sources
 pixi run build        # verify the package compiles
+pixi run bench        # throughput + accuracy benchmarks
 ```
+
+### Benchmark snapshot
+
+Measured over N(0,1) on an Apple-silicon dev box (`pixi run bench`; indicative,
+not a committed SLA):
+
+| Scale | δ | ns/add | p0.1 rank err | p50 rank err | p99.9 rank err |
+| ----- | --- | ------ | ------------- | ------------ | -------------- |
+| K0 | 100 | ~76 | 9.6e-4 | 2.8e-4 | 1.0e-3 |
+| K1 | 100 | ~89 | 1.1e-4 | 1.9e-4 | 1.3e-4 |
+| K2 | 100 | ~90 | 2.0e-5 | 9.0e-4 | 5.0e-6 |
+| K2 | 200 | ~140 | 1.5e-5 | 1.1e-4 | 5.0e-6 |
+
+K2/K3 drive tail error into the single-digit-ppm range (trading some median
+accuracy); K0 (linear) has the weakest tails. This is the t-digest trade-off the
+scale function selects.
 
 See [`PLAN.md`](./PLAN.md) for the step-by-step build-out.
 
