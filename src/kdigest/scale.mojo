@@ -35,8 +35,11 @@ def _clamp_q(q: Float64) -> Float64:
     return q
 
 
-trait ScaleFunction(Copyable, Movable):
+trait ScaleFunction(Deinitable, ImplicitlyCopyable, Movable):
     """A t-digest scale function and its inverse."""
+
+    def __init__(out self):
+        ...
 
     def normalizer(self, compression: Float64, n: Float64) -> Float64:
         ...

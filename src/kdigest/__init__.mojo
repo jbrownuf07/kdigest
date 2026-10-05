@@ -15,3 +15,4 @@ from kdigest.scale import (
     ScaleK2,
     ScaleK3,
 )
+from kdigest.tdigest import TDigest

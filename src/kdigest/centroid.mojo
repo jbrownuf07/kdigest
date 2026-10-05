@@ -7,7 +7,7 @@ decay is applied (Phase 3).
 
 
 @fieldwise_init
-struct Centroid(Copyable, Movable, Writable):
+struct Centroid(ImplicitlyCopyable, Movable, Writable):
     var mean: Float64
     var weight: Float64
 
