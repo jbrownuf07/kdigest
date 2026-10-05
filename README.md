@@ -173,7 +173,9 @@ This project uses [`pixi`](https://pixi.sh) with the Modular MAX conda channel.
 
 ```bash
 pixi install          # resolve the Mojo toolchain
-pixi run mojo test test/   # run the test suite (once tasks are wired up)
+pixi run test         # run the test suite (mojo run over test/test_*.mojo)
+pixi run fmt          # format sources
+pixi run build        # verify the package compiles
 ```
 
 See [`PLAN.md`](./PLAN.md) for the step-by-step build-out.

@@ -23,8 +23,11 @@ layer on decay and performance.
 **Steps**
 
 1. Add `[tasks]` to `pixi.toml`:
-   - `test = "mojo test test/"`
+   - `test` — runs `scripts/run_tests.sh`, which `mojo run`s each
+     `test/test_*.mojo` against a `TestSuite` runner (the `mojo test`
+     subcommand was removed in Mojo 1.1).
    - `fmt  = "mojo format src/ test/"`
+   - `build` — compiles the package to verify it builds.
 2. Create package skeleton and a smoke test that imports the package.
 3. Verify: `pixi run test` passes on an empty suite.
 
