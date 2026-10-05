@@ -48,8 +48,10 @@ comptime _PRUNE_EPSILON = 1e-6
 
 # add_batch dispatches to the GPU only above this batch size; below it the fixed
 # per-call cost (device context + workspace allocation, a few GPU syncs) wins
-# and the CPU buffer path is faster. Measured in bench/bench_gpu.mojo (Apple
-# silicon): one-shot GPU is 0.98x the CPU at 50k points and 1.54x at 100k.
+# and the CPU buffer path is faster. Measured in bench/bench_gpu.mojo on an
+# Apple M1 Max (Metal, unified memory): one-shot GPU is 0.98x the CPU at 50k
+# points and 1.54x at 100k. These thresholds are hardware-specific; re-derive
+# them with `pixi run bench-gpu` on other machines (see bench/Benchmark.md).
 comptime _GPU_CROSSOVER = 60_000
 # With a caller-held `GpuSession` the context and workspace are reused, so the
 # GPU wins sooner: 0.78x at 30k, 1.27x at 50k.

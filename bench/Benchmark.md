@@ -10,10 +10,70 @@ pixi run bench       # CPU: throughput, accuracy, seasonal (Sections 1–3)
 pixi run bench-gpu   # GPU: accuracy + CPU/GPU crossover (Section 4; needs an accelerator)
 ```
 
-All numbers below were captured on an Apple-silicon (`osx-arm64`) dev box with
-the nightly Mojo toolchain. **Throughput is hardware- and build-dependent and is
-not a committed SLA**; the accuracy and tracking numbers are deterministic given
-the fixed RNG seeds and should reproduce closely across machines.
+All numbers below were captured on the test system described next. **Throughput
+is hardware- and build-dependent and is not a committed SLA**; the accuracy and
+tracking numbers are deterministic given the fixed RNG seeds and should
+reproduce closely across machines (see
+[How portable are these numbers?](#how-portable-are-these-numbers)).
+
+### Test system
+
+| Component | Value |
+| --------- | ----- |
+| Machine | MacBook Pro (`MacBookPro18,2`), 16-inch, 2021 |
+| SoC | Apple M1 Max |
+| CPU | 10 cores (8 performance + 2 efficiency); the CPU baselines are **single-threaded** |
+| GPU | Apple M1 Max integrated GPU, 24 cores, Metal 4 |
+| Memory | 32 GB unified LPDDR5 (shared by CPU and GPU, ~400 GB/s peak) |
+| OS | macOS 26.7.1 (build 25G241) |
+| Toolchain | Mojo 1.1.0 (`8189361e`), MAX `max-core` 26.6.0 (release), via pixi |
+| Platform | `osx-arm64` |
+
+Timings are wall-clock, best of 3 runs per row (Section 4), on a laptop. Power
+source and thermal state were not controlled.
+
+### How portable are these numbers?
+
+**Accuracy: mostly portable. Speed: not portable. On different hardware the
+absolute numbers will differ, and the crossovers and trends can shift too.**
+
+- **Accuracy** comes from the algorithm and the fixed seeds, so the rank-error
+  tables should reproduce closely anywhere. The CPU path is Float64 and
+  deterministic. The GPU path is Float32 and runs the kernels' operations in a
+  fixed order, but `log`/`asin` implementations differ between GPU vendors and
+  drivers. Cluster boundaries can therefore move slightly on another device:
+  expect *close*, not bit-identical, GPU accuracy numbers. (The bit-identical
+  guarantees in Section 4 compare GPU paths with each other *on the same
+  device*.)
+- **Absolute throughput** depends on CPU single-core speed, GPU size, memory
+  bandwidth and the driver. A newer CPU core lowers the CPU baseline and pushes
+  the crossovers up. A bigger GPU lowers the GPU numbers and pulls them down.
+- **Crossover points and trends can change, not just scale.** The GPU curves
+  here are shaped by costs specific to this setup:
+  - **Fixed cost per call (~0.9 ms)** is mostly Metal launch and
+    synchronization latency (4e measures it: ~30–50 µs per launch, ~170 µs per
+    synchronize). CUDA on a discrete GPU typically has much lower launch
+    latency, which would move the small-batch crossover (~40k here) *down*.
+  - **Unified memory.** On Apple silicon a "host↔device copy" is a memcpy
+    within the same RAM. A discrete GPU has to cross PCIe, so per-byte transfer
+    costs are higher and large batches could become transfer-bound. That could
+    flatten or reverse the large-N trend.
+  - **The taper above ~1M points** comes from the GPU merge-sort passes and
+    memory bandwidth (~400 GB/s here). A GPU with much higher bandwidth (e.g.
+    HBM) would taper later or not at all.
+  - **The grouped path** runs one block per key, so its speedup scales with how
+    many blocks the GPU runs concurrently (24 cores here; data-center GPUs have
+    100+ SMs). A bigger GPU should widen the 2.5–4.3× lead. The ≤ ~100
+    samples/key rows are limited by CPU-side bookkeeping, so they would
+    change less.
+  - **Kernel shape.** The kernels assume `BLOCK_CAP = 1024` threads per block
+    and ~20 KB of shared memory per block. On GPUs with different warp or
+    wavefront widths, occupancy limits or shared-memory sizes, the
+    per-block cost (and possibly the best `BLOCK_CAP`) would differ.
+- **The dispatch thresholds** (`_GPU_CROSSOVER` = 60k,
+  `_GPU_CROSSOVER_SESSION` = 40k) were tuned on this machine only. Before
+  relying on them on other hardware, rerun `pixi run bench-gpu` there and
+  re-derive them.
 
 ---
 
@@ -160,9 +220,13 @@ the CPU's sequential greedy sweep. This benchmark
 questions side by side: **is the GPU result as accurate**, and **when (if ever)
 is it faster** than the CPU on the current implementation.
 
-All GPU numbers are Float32 (the device dtype); CPU is Float64. Captured on an
-Apple-silicon (`osx-arm64`) dev box. **These are not an SLA** — they exist to
-locate the break-even points and to be honest about where the backend stands.
+All GPU numbers are Float32 (the device dtype); CPU is Float64 and
+single-threaded. Captured on the Apple M1 Max described in
+[Test system](#test-system) (24-core integrated GPU, Metal, unified memory).
+**These are not an SLA**: they exist to locate the break-even points on this
+machine and to be honest about where the backend stands. The crossovers in
+particular are expected to move on other hardware (see
+[How portable are these numbers?](#how-portable-are-these-numbers)).
 
 The benchmark holds **one `GpuSession`** (device context + reusable workspaces)
 for the whole run and times each GPU path two ways: **one-shot** (a fresh
